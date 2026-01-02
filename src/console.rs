@@ -1,0 +1,23 @@
+use log::{error, info};
+
+pub fn start_loop() {
+    info!("Ready. Enter `help` for help. Hit Ctrl-C to exit.");
+
+    loop {
+        if !console_loop_once() {
+            break;
+        }
+    }
+}
+
+fn console_loop_once() -> bool {
+    let input = inquire::Text::new("YukiNet $")
+        .prompt();
+
+    let input = match input {
+        Ok(input) => input,
+        Err(err) => return false
+    };
+
+    true
+}

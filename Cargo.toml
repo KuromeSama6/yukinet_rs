@@ -1,0 +1,18 @@
+[package]
+name = "yukinet_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+log4rs = "*"
+log = "*"
+fs = "*"
+serde = "*"
+serde_json = "*"
+rand = "*"
+hex = "*"
+tokio = { version = "*", features = ["full"] }
+tokio-tungstenite = "*"
+inquire = "*"
+anyhow = "*"
+futures-util = "0.3.31"
