@@ -1,4 +1,7 @@
+use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc::UnboundedReceiver;
+use uuid::{uuid, Uuid};
 use crate::util::generate_random_bytes;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -26,6 +29,7 @@ impl Default for MasterConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WorkerConfig {
+    pub worker_id: String,
     pub master_uri: String,
     pub secret: String,
 }
@@ -33,8 +37,27 @@ pub struct WorkerConfig {
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
-            master_uri: "ws://127.0.0.1/".to_string(),
+            worker_id: Uuid::now_v7().to_string(),
+            master_uri: "ws://127.0.0.1:7940/".to_string(),
             secret: "".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum WebsocketMessage {
+    Registration {
+        worker_id: String,
+        secret: String,
+    },
+    RegistrationAck,
+}
+
+impl WebsocketMessage {
+    pub fn registration(config: &WorkerConfig) -> Self {
+        WebsocketMessage::Registration {
+            worker_id: config.worker_id.clone(),
+            secret: config.secret.clone(),
         }
     }
 }

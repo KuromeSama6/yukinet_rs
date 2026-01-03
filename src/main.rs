@@ -13,6 +13,7 @@ mod util;
 mod console;
 mod master;
 mod worker;
+mod error;
 
 #[tokio::main]
 async fn main() {
@@ -21,10 +22,15 @@ async fn main() {
 
     run_firsttime_setup();
 
-    init_systems();
+    info!("Starting master and worker websockets...");
+    init_systems().await;
 
     console::start_loop();
     info!("Exiting...");
+
+    shutdown().await;
+
+    info!("Goodbye.");
 }
 
 fn app_init() {
@@ -54,13 +60,17 @@ fn run_firsttime_setup() {
     }
 }
 
-fn init_systems() {
-    let running_master = master::init();
-    let running_worker = worker::init();
+async fn init_systems() {
+    let running_master = master::init().await;
+    let running_worker = worker::init().await;
 
     if !running_master && !running_worker {
         error!("Neither master nor worker mode is enabled. At least one mode must be enabled to run the application. Please check your configuration files.");
         exit(1);
     }
+}
 
+async fn shutdown() {
+    worker::shutdown().await;
+    master::shutdown().await;
 }

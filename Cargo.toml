@@ -15,4 +15,7 @@ tokio = { version = "*", features = ["full"] }
 tokio-tungstenite = "*"
 inquire = "*"
 anyhow = "*"
-futures-util = "0.3.31"
+futures-util = "*"
+uuid = {  version = "*", features = ["fast-rng", "v7", "v4"] }
+thiserror = "*"
+once_cell = "*"

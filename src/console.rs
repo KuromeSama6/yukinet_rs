@@ -8,6 +8,8 @@ pub fn start_loop() {
             break;
         }
     }
+
+    info!("Console shutting down.");
 }
 
 fn console_loop_once() -> bool {
