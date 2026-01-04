@@ -4,6 +4,7 @@ use std::fs::{exists, File};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use anyhow::anyhow;
+use async_trait::async_trait;
 use futures_util::future::err;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
@@ -13,13 +14,14 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, RwLock};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot::Receiver;
-use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use crate::error::WebsocketError;
 use crate::error::WebsocketError::{AuthenticationFailure, ClientDisconnect, NotAuthenticated, Protocol, UnknownMessage};
 use crate::master::MasterCommand::Shutdown;
 use crate::util::{Outgoing, WebsocketOutgoing};
+use crate::websocket::server::{Client, ServerHandler, WebsocketServer};
 use crate::websocket::WebsocketMessage;
 
 static STATE: OnceLock<Arc<MasterState>> = OnceLock::new();
@@ -31,7 +33,7 @@ pub async fn init() -> anyhow::Result<bool> {
     }
 
     let config: MasterConfig = serde_json::from_reader(File::open(config_path)?)?;
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, cmd_rx) = mpsc::channel(32);
     let state = Arc::new(MasterState::new(config, cmd_tx));
     STATE.set(state.clone()).unwrap();
 
@@ -39,7 +41,14 @@ pub async fn init() -> anyhow::Result<bool> {
     tokio::spawn(master_command_loop(state.clone(), cmd_rx));
 
     // websocket
-    start_websocket_server(state).await?;
+    let handler = WebsocketHandler {
+        state: state.clone(),
+        connect_headers: OnceLock::new()
+    };
+
+    let addr: SocketAddr = format!("{}:{}", state.config.websocket_host, state.config.websocket_port).parse()?;
+
+    let ws_server = WebsocketServer::start_new(&addr, handler).await?;
 
     Ok(true)
 }
@@ -54,60 +63,44 @@ pub async fn shutdown() {
     }
 
     info!("Master shutting down...");
-    master_send_cmd(Shutdown);
+    master_send_cmd(Shutdown).await;
 }
 
-async fn start_websocket_server(state: Arc<MasterState>) -> anyhow::Result<()> {
-    let addr_str = format!("{}:{}", state.config.websocket_host, state.config.websocket_port);
+async fn master_command_loop(state: Arc<MasterState>, mut cmd_rx: mpsc::Receiver<Outgoing<MasterCommand, ()>>) {
+    while let Some(outgoing) = cmd_rx.recv().await {
+        match outgoing.msg {
+            Shutdown => {
+                info!("Master command loop shutting down.");
+                state.shutdown.cancel();
+                outgoing.ack.send(Ok(()));
 
-    let addr: SocketAddr = addr_str.parse()?;
-    let (tx, rx) = oneshot::channel();
-
-    tokio::spawn(async move {
-        let res = websocket_loop(state, addr, tx).await;
-        if let Err(e) = res {
-            error!("Websocket server exited with error: {:?}", e);
-        }
-    });
-
-    rx.await?;
-
-    Ok(())
-}
-
-async fn websocket_loop(state: Arc<MasterState>, addr: SocketAddr, ready_tx: oneshot::Sender<()>) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    info!("Websocket server started at {}", addr);
-    ready_tx.send(()).unwrap();
-
-    loop {
-        tokio::select! {
-            Ok((stream, addr)) = listener.accept() => {
-                info!("Client connected: {addr}, awaiting authentication.");
-                let state = state.clone();
-
-                tokio::spawn(async move {
-                    let res = websocket_handle_connection(state, addr, stream).await;
-                    if let Err(e) = res {
-                        error!("Websocket connection error for addr {addr}, {e}");
-                    }
-                });
-            }
-
-            _ = state.shutdown.cancelled() => {
-                info!("Websocket server shutting down.");
                 break;
+            }
+            _ => {
+                outgoing.ack.send(Ok(()));
             }
         }
     }
-
-    Ok(())
 }
 
-async fn websocket_handle_connection(state: Arc<MasterState>, addr: SocketAddr, stream: net::TcpStream) -> anyhow::Result<()> {
-    let connect_headers: OnceCell<String> = OnceCell::new();
+async fn master_send_cmd(cmd: MasterCommand) -> anyhow::Result<()> {
+    let state = STATE.get().unwrap();
+    let (outgoing, ack) = Outgoing::new(cmd);
 
-    let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, res: Response| {
+    state.cmd_tx.send(outgoing).await?;
+
+    ack.await?
+}
+
+#[derive(Debug)]
+struct WebsocketHandler {
+    state: Arc<MasterState>,
+    connect_headers: OnceLock<String>,
+}
+
+#[async_trait]
+impl ServerHandler for WebsocketHandler {
+    fn handle_header(&self, server: Arc<WebsocketServer>, req: &Request, res: Response) -> Result<Response, ErrorResponse> {
         let id_header = req.headers().get("X-YukiNet-Worker-Id");
         if id_header.is_none() {
             error!("Worker authentication failure, missing id header!");
@@ -129,7 +122,7 @@ async fn websocket_handle_connection(state: Arc<MasterState>, addr: SocketAddr, 
         }
 
         let secret = secret_header.unwrap().to_str().unwrap();
-        if secret != state.config.secret {
+        if secret != self.state.config.secret {
             error!("Worker authentication failure, secret mismatch!");
             let err = Response::builder()
                 .status(401)
@@ -139,171 +132,40 @@ async fn websocket_handle_connection(state: Arc<MasterState>, addr: SocketAddr, 
         }
 
         let id = id_header.unwrap().to_str().unwrap().to_string();
-        connect_headers.set(id).unwrap();
+        self.connect_headers.set(id).unwrap();
 
         Ok(res)
-    }).await?;
-
-    let (mut tx, mut rx) = ws.split();
-    let worker_id = connect_headers.get().unwrap().clone();
-
-    if state.get_worker_by_id(&worker_id).await.is_some() {
-        error!("Worker authentication failure, duplicate worker ID: {}", worker_id);
-        tx.send(Message::Close(None)).await;
-        tx.flush().await;
-        tx.close().await?;
-        return Err(anyhow!("Duplicate worker ID"));
     }
 
-    info!("Worker connected: {addr} with id {worker_id}");
+    async fn on_connected(&self, server: Arc<WebsocketServer>, addr: SocketAddr) -> anyhow::Result<()> {
+        let client_id = self.connect_headers.get().unwrap().clone();
+        let client = server.get_client(addr).await.unwrap();
 
-    let (worker, mut worker_rx) = Worker::new(worker_id, addr);
-    state.add_worker(worker).await;
-
-    loop {
-        let state = state.clone();
-
-        tokio::select! {
-            Some(msg) = rx.next() => {
-                match msg {
-                    Ok(msg) => {
-                        let res = websocket_handle_msg(state, addr, msg).await;
-                        match res {
-                            Ok(response_msg) => {
-                                let msg_str = serde_json::to_string(&response_msg)?;
-                                tx.send(Message::text(msg_str)).await?;
-                            }
-                            Err(ClientDisconnect(_)) => {
-                                warn!("Client requested disconnect: {addr}");
-                                break;
-                            }
-                            Err(err) => {
-                                error!("Websocket error for addr {addr}: {err}");
-                                break;
-                            }
-                        }
-
-                    }
-                    Err(err) => {
-                        error!("Unexpected websocket error for addr {addr}: {err}");
-                        break;
-                    }
-                }
-            }
-
-            Some(outgoing) = worker_rx.recv() => {
-                let msg = outgoing.msg;
-                let msg_str = serde_json::to_string(&msg)?;
-                tx.send(Message::text(msg_str)).await?;
-                
-                // always expect response
-                let res = rx.next().await;
-                match res {
-                    Some(Ok(Message::Text(text))) => {
-                        let ws_msg: WebsocketMessage = serde_json::from_str(&text)?;
-                        outgoing.ack.send(Ok(ws_msg)).unwrap();
-                    }
-                    Some(Ok(_)) => {
-                        warn!("Unexpected non-text websocket message from worker.");
-                        outgoing.ack.send(Err(anyhow!("Unexpected non-text websocket message from worker."))).unwrap();
-                    }
-                    Some(Err(e)) => {
-                        error!("Websocket error receiving response from worker: {}", e);
-                        outgoing.ack.send(Err(anyhow!("Websocket error: {}", e))).unwrap();
-                    }
-                    None => {
-                        warn!("Websocket connection closed by worker while waiting for response.");
-                        outgoing.ack.send(Err(anyhow!("Websocket connection closed by worker."))).unwrap();
-                        break;
-                    }
-                }
-                
-            }
-
-            _ = state.shutdown.cancelled() => {
-                tx.send(Message::Close(None)).await?;
-                break;
-            }
+        if self.state.get_worker_by_id(&client_id).await.is_some() {
+            error!("Worker authentication failure, duplicate client ID: {}", client_id);
+            client.graceful_disconnect("Duplicate client ID").await?;
+            return Err(anyhow!("Duplicate client ID"));
         }
+
+        info!("Worker connected: {addr} with id {client_id}");
+
+        let (worker, mut client_rx) = Worker::new(client_id, addr);
+        self.state.add_worker(worker).await;
+
+        Ok(())
     }
-
-    warn!("Websocket client disconnected: {addr}");
-    state.remove_worker(&addr).await;
-
-    Ok(())
-}
-
-async fn websocket_handle_msg(state: Arc<MasterState>, addr: SocketAddr, msg: Message) -> anyhow::Result<WebsocketMessage, WebsocketError> {
-    match msg {
-        Message::Text(text) => {
-            let msg: WebsocketMessage = serde_json::from_str(&text)?;
-
-            websocket_handle_msg_text(state, addr, msg).await
-        }
-
-        Message::Close(frame) => {
-            Err(ClientDisconnect(frame.unwrap().reason.to_string()))
-        }
-
-        _ => {
-             Err(UnknownMessage)
-        }
-    }
-}
-
-async fn websocket_handle_msg_text(state: Arc<MasterState>, addr: SocketAddr, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage, WebsocketError> {
-    if !state.is_authenticated(&addr).await {
-        return Err(NotAuthenticated);
-    }
-
-    let worker = state.get_worker(addr).await.unwrap();
-
-    match msg {
-        WebsocketMessage::WorkerDisconnect(reason) => {
-            warn!("Worker at {addr} requested disconnect: {reason}");
-            return Err(ClientDisconnect(reason));
-        }
-        _ => {
-            warn!("Unexpected websocket message: {msg:?}");
-        }
-    }
-
-    Ok(WebsocketMessage::Ack)
-}
-
-async fn websocket_send(worker: &Worker, msg: WebsocketMessage) -> anyhow::Result<()> {
-    Ok(())
-}
-
-async fn master_command_loop(state: Arc<MasterState>, mut cmd_rx: UnboundedReceiver<MasterCommand>) {
-    while let Some(cmd) = cmd_rx.recv().await {
-        match cmd {
-            Shutdown => {
-                info!("Master command loop shutting down.");
-                state.shutdown.cancel();
-                break;
-            }
-            _ => {}
-        }
-    }
-}
-
-fn master_send_cmd(cmd: MasterCommand) {
-    let state = STATE.get().unwrap();
-
-    state.cmd_tx.send(cmd).unwrap();
 }
 
 #[derive(Debug)]
 struct MasterState {
     config: MasterConfig,
     workers: RwLock<HashMap<SocketAddr, Worker>>,
-    cmd_tx: UnboundedSender<MasterCommand>,
+    cmd_tx: Sender<Outgoing<MasterCommand, ()>>,
     shutdown: CancellationToken
 }
 
 impl MasterState {
-    pub fn new(config: MasterConfig, cmd_tx: UnboundedSender<MasterCommand>) -> Self {
+    pub fn new(config: MasterConfig, cmd_tx: Sender<Outgoing<MasterCommand, ()>>) -> Self {
         MasterState {
             config,
             workers: RwLock::new(HashMap::new()),
@@ -368,13 +230,13 @@ impl Worker {
 
         (ret, rx)
     }
-    
+
     pub async fn send_ws_msg(&self, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
         let (msg, ack) = Outgoing::new(msg);
         self.websocket_tx.send(msg).await?;
-        
+
         let res = ack.await?;
-        
+
         res
     }
 }
