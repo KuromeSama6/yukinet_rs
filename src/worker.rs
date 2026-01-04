@@ -1,114 +1,144 @@
 use std::fs;
-use std::fs::File;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
-use log::info;
-use once_cell::sync::OnceCell;
-use serde_json::json;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::sync::oneshot::Sender;
-use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use crate::data::{WorkerConfig};
-use crate::data::WebsocketMessage;
-use crate::worker::WorkerCommand::Shutdown;
+use http::Request;
+use log::{error, info, warn};
+use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::tungstenite::{Error, Message, Utf8Bytes};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use url::Url;
+use crate::config::{WorkerConfig};
+use crate::util::{Outgoing, WebsocketOutgoing};
+use crate::websocket::WebsocketMessage;
 
-static ENABLED: OnceCell<bool> = OnceCell::new();
-static CMD_TX: OnceCell<UnboundedSender<WorkerCommand>> = OnceCell::new();
+static STATE: OnceLock<Arc<WorkerState>> = OnceLock::new();
 
-pub async fn init() -> bool {
-    let config_path = "config/worker_config.json";
-    if !fs::exists(config_path).unwrap() {
-        info!("Not running as worker as the worker config file does not exist. To run YukiNet as worker, please create the config/worker_config.json file.");
-        ENABLED.set(false).unwrap();
-        return false;
+pub async fn init() -> anyhow::Result<bool> {
+    let config_file_path = "config/worker_config.json";
+    if !fs::exists(config_file_path)? {
+        return Ok(false);
     }
-    ENABLED.set(true).unwrap();
-    
-    
-    let file = File::open(config_path).unwrap();
-    let config: WorkerConfig = serde_json::from_reader(file).unwrap();
+    let config: WorkerConfig = serde_json::from_reader(fs::File::open(config_file_path)?)?;
+    let state = WorkerState {
+        config,
+        websocket_tx: OnceLock::new(),
+    };
+    let state = Arc::new(state);
+    STATE.set(state.clone());
 
-    info!("Starting YukiNet worker...");
+    connect_websocket(state).await?;
 
-    // init chan
-    let (tx, rx) = unbounded_channel();
-    CMD_TX.set(tx).unwrap();
-
-    let state = WorkerState::new(Arc::new(config), rx);
-
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-
-    tokio::spawn(async move {
-        if let Err(err) = run_websocket_client(state, ready_tx).await {
-            log::error!("Failed to run worker: {}", err);
-        }
-    });
-
-    ready_rx.await.ok();
-
-    true
+    Ok(true)
 }
 
 pub fn is_enabled() -> bool {
-    ENABLED.get().unwrap().clone()
+    STATE.get().is_some()
 }
 
 pub async fn shutdown() {
     if !is_enabled() {
         return;
     }
-    
-    send_worker_cmd(Shutdown).await;
+
+    info!("Worker shutting down...");
+    info!("Note - Websocket errors during shutdown are expected.");
+
+    let state = STATE.get().unwrap();
+    state.send_ws_msg(WebsocketMessage::WorkerDisconnect("Worker shutting down".to_string())).await;
 }
 
-async fn run_websocket_client(mut state: WorkerState, ready_tx: Sender<()>) -> anyhow::Result<()> {
-    let addr_str = &state.config.master_uri;
-    let (ws, _) = tokio_tungstenite::connect_async(addr_str)
-        .await
-        .with_context(|| format!("Failed to connect to master at {}", addr_str))?;
+async fn connect_websocket(state: Arc<WorkerState>) -> anyhow::Result<()> {
+    let (ready_tx, ready_rx) = oneshot::channel();
 
-    info!("Connected to master at {}", addr_str);
-    ready_tx.send(()).ok();
+    let url = Url::parse(&state.config.master_uri)
+        .context("Invalid master websocket URL")?;
+
+    let mut request = url.as_str().into_client_request()?;
+    request.headers_mut().insert("X-YukiNet-Worker-Id", state.config.worker_id.parse()?);
+    request.headers_mut().insert("X-YukiNet-Secret", state.config.secret.parse()?);
+
+    tokio::spawn(async move {
+        let res = websocket_loop(request, state, ready_tx).await;
+        if let Err(e) = res {
+            error!("Websocket loop exited with error: {}", e);
+        }
+    });
+
+    ready_rx.await?;
+
+    Ok(())
+}
+
+async fn websocket_loop(conn_request: Request<()>, state: Arc<WorkerState>, ready_tx: oneshot::Sender<()>) -> anyhow::Result<()> {
+    let uri = conn_request.uri().clone();
+    info!("Connecting to master at {uri}...");
+
+    let res = tokio_tungstenite::connect_async(conn_request).await;
+
+    if let Err(e) = res {
+        match e {
+            Error::Http(response) => {
+                let status = response.status();
+                let reason = status.canonical_reason().unwrap_or("Unknown Error");
+                error!("Failed to connect to master at {uri}: HTTP {} {}", status.as_u16(), reason);
+                return Err(anyhow::anyhow!("HTTP error {} {}", status.as_u16(), reason));
+            }
+            _ => {
+                error!("Failed to connect to master at {uri}: {}", e);
+                return Err(anyhow::anyhow!("Connection error: {}", e));
+            }
+        }
+    }
+
+    let (ws, res) = res.unwrap();
+
+    info!("Connected to master at {uri}");
+    ready_tx.send(()).unwrap();
 
     let (mut tx, mut rx) = ws.split();
-
-    // send registration message
-    let register_msg = serde_json::to_string(&WebsocketMessage::registration(state.config.as_ref()))?;
-    tx.send(Message::Text(Utf8Bytes::from(register_msg))).await?;
+    let (websocket_tx, mut websocket_rx) = mpsc::channel(32);
+    state.websocket_tx.set(websocket_tx).unwrap();
 
     loop {
         tokio::select! {
-            Some(msg) = rx.next() => {
-                let msg = msg?;
-                match msg {
-                    Message::Text(text) => {
-                        let message: WebsocketMessage = serde_json::from_str(&text.to_string())?;
-                        handle_text_response(message).await?;
-                    }
-                    Message::Ping(ping) => {
-                        tx.send(Message::Pong(ping)).await?;
-                    }
-                    _ => {}
-                }
-            }
+            res = rx.next() => {
+                match res {
+                    Some(msg) => {
 
-            Some(command) = state.cmd_rx.recv() => {
-                match command {
-                    Shutdown => {
-                        info!("Shutting down worker...");
-                        let frame = CloseFrame {
-                            code: CloseCode::Normal,
-                            reason: "Worker disconnecting".into()
-                        };
-                        tx.send(Message::Close(Some(frame))).await?;
-
+                    }
+                    None => {
+                        warn!("Websocket connection closed by master.");
                         break;
                     }
-                    
-                    _ => {}
+                }
+            }
+
+            Some(outgoing) = websocket_rx.recv() => {
+                let msg_str = serde_json::to_string(&outgoing.msg)?;
+                tx.send(Message::text(Utf8Bytes::from(msg_str))).await?;
+
+                // always expect an ack for outgoing messages
+                let res = rx.next().await;
+                match res {
+                    Some(Ok(Message::Text(text))) => {
+                        let ws_msg: WebsocketMessage = serde_json::from_str(&text)?;
+                        outgoing.ack.send(Ok(ws_msg)).unwrap();
+                    }
+                    Some(Ok(_)) => {
+                        warn!("Unexpected non-text websocket message from master.");
+                        outgoing.ack.send(Err(anyhow::anyhow!("Unexpected message from master."))).unwrap();
+                    }
+                    Some(Err(e)) => {
+                        error!("Websocket error receiving ack from master: {}", e);
+                        outgoing.ack.send(Err(anyhow::anyhow!("Websocket error: {}", e))).unwrap();
+                    }
+                    None => {
+                        warn!("Websocket connection closed by master while waiting for ack.");
+                        outgoing.ack.send(Err(anyhow::anyhow!("Websocket connection closed by master."))).unwrap();
+                        break;
+                    }
                 }
             }
         }
@@ -117,39 +147,19 @@ async fn run_websocket_client(mut state: WorkerState, ready_tx: Sender<()>) -> a
     Ok(())
 }
 
-async fn handle_text_response(msg: WebsocketMessage) -> anyhow::Result<()> {
-    match msg {
-        WebsocketMessage::RegistrationAck => {
-            info!("Successfully registered with master.");
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-
-async fn send_worker_cmd(cmd: WorkerCommand) {
-    CMD_TX.get().map(|tx| {
-        let _ = tx.send(cmd);
-    });
-}
-
-
 struct WorkerState {
-    config: Arc<WorkerConfig>,
-    cmd_rx: UnboundedReceiver<WorkerCommand>,
+    config: WorkerConfig,
+    websocket_tx: OnceLock<Sender<WebsocketOutgoing>>,
 }
 
 impl WorkerState {
-    pub fn new(config: Arc<WorkerConfig>, rx: UnboundedReceiver<WorkerCommand>) -> Self {
-        Self {
-            config,
-            cmd_rx: rx
-        }
-    }
-}
+    pub async fn send_ws_msg(&self, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
+        let (msg, ack) = Outgoing::new(msg);
 
-enum WorkerCommand {
-    RequestResourceSync,
-    Shutdown,
+        if let Some(tx) = self.websocket_tx.get() {
+            tx.send(msg).await?;
+        }
+
+        ack.await?
+    }
 }

@@ -8,8 +8,10 @@ pub enum WebsocketError {
     NotAuthenticated,
     #[error("An invalid secret was provided by the incoming worker")]
     AuthenticationFailure,
+    #[error("Protocol error")]
+    Protocol,
     #[error("Received an unknown message type")]
     UnknownMessage,
     #[error("The worker has disconnected")]
-    ClientDisconnect,
+    ClientDisconnect(String),
 }

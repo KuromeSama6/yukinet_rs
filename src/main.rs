@@ -1,29 +1,37 @@
-use data::MasterConfig;
+use config::MasterConfig;
 use std::fs;
 use std::fs::{read, File};
 use std::process::exit;
 use log4rs::append::console::ConsoleAppender;
 use log::{error, info, log};
-use crate::data::WorkerConfig;
+use crate::config::WorkerConfig;
 
-mod data;
+mod config;
 mod constants;
 mod logging;
 mod util;
 mod console;
-mod master;
-mod worker;
 mod error;
+mod master;
+mod resources;
+mod worker;
+mod websocket;
+mod command;
 
 #[tokio::main]
 async fn main() {
     println!("{}", constants::SPLASH_MESSAGE);
     app_init();
 
-    run_firsttime_setup();
+    info!("YukiNet starting up...");
 
-    info!("Starting master and worker websockets...");
-    init_systems().await;
+    run_setup();
+
+    let init_systems_ok = init_modules().await;
+    if let Err(e) = init_systems_ok {
+        error!("Failed to initialize service modules: {}", e);
+        exit(1);
+    }
 
     console::start_loop();
     info!("Exiting...");
@@ -37,37 +45,48 @@ fn app_init() {
     logging::init();
 }
 
-fn run_firsttime_setup() {
-    let exists = fs::exists(".yukinet").unwrap_or(false);
+fn run_setup() {
+    let config_dir_path = "config";
+    fs::create_dir_all(config_dir_path).unwrap();
 
-    if !exists {
-        info!("First time setup detected, creating necessary files...");
-        File::create(".yukinet").unwrap();
-        fs::create_dir_all("resources").unwrap();
-        fs::create_dir_all("config").unwrap();
+    let master_config_path = format!("{}/master_config.json", config_dir_path);
+    let worker_config_path = format!("{}/worker_config.json", config_dir_path);
 
-        let master_config = MasterConfig::default();
-        let master_config_file = File::create("config/master_config.json").unwrap();
-        serde_json::to_writer_pretty(master_config_file, &master_config).unwrap();
+    if !fs::exists(&master_config_path).unwrap() && !fs::exists(&worker_config_path).unwrap() {
+        info!("No configuration files found. Running initial setup...");
 
-        let worker_config = WorkerConfig::default();
-        let worker_config_file = File::create("config/worker_config.json").unwrap();
-        serde_json::to_writer_pretty(worker_config_file, &worker_config).unwrap();
+        let default_master_config = MasterConfig::default();
+        let default_worker_config = WorkerConfig::default();
 
-        info!("Please configure the application before running again.");
+        fs::write(&master_config_path, serde_json::to_string_pretty(&default_master_config).unwrap()).unwrap();
+        fs::write(&worker_config_path, serde_json::to_string_pretty(&default_worker_config).unwrap()).unwrap();
 
+        info!("Default configuration files created at '{}'. Please review and modify them as needed before restarting the application.", config_dir_path);
         exit(0);
     }
+
+    // resources dir
+    fs::create_dir_all("resources").unwrap();
+
 }
 
-async fn init_systems() {
-    let running_master = master::init().await;
-    let running_worker = worker::init().await;
-
-    if !running_master && !running_worker {
-        error!("Neither master nor worker mode is enabled. At least one mode must be enabled to run the application. Please check your configuration files.");
+async fn init_modules() -> anyhow::Result<()> {
+    let master_running = master::init().await?;
+    if !master_running {
+        info!("No master server is running. Running in worker-only mode.");
+    }
+    
+    let worker_running = worker::init().await?;
+    if !worker_running {
+        info!("No worker configuration found. Running in master-only mode.");
+    }
+    
+    if !master_running && !worker_running {
+        error!("Neither master nor worker systems could be initialized. Please check your configuration files.");
         exit(1);
     }
+
+    Ok(())
 }
 
 async fn shutdown() {

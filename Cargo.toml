@@ -19,3 +19,7 @@ futures-util = "*"
 uuid = {  version = "*", features = ["fast-rng", "v7", "v4"] }
 thiserror = "*"
 once_cell = "*"
+tokio-util = "*"
+http = "*"
+url = "*"
+clap = { version = "*", features = ["derive"] }

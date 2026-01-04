@@ -43,21 +43,3 @@ impl Default for WorkerConfig {
         }
     }
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum WebsocketMessage {
-    Registration {
-        worker_id: String,
-        secret: String,
-    },
-    RegistrationAck,
-}
-
-impl WebsocketMessage {
-    pub fn registration(config: &WorkerConfig) -> Self {
-        WebsocketMessage::Registration {
-            worker_id: config.worker_id.clone(),
-            secret: config.secret.clone(),
-        }
-    }
-}

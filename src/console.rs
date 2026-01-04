@@ -1,4 +1,6 @@
 use log::{error, info};
+use crate::command::Command;
+use crate::worker;
 
 pub fn start_loop() {
     info!("Ready. Enter `help` for help. Hit Ctrl-C to exit.");
@@ -22,4 +24,8 @@ fn console_loop_once() -> bool {
     };
 
     true
+}
+
+fn handle_cmd(cmd: Command) {
+
 }
