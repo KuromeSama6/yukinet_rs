@@ -5,16 +5,17 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::{Error, Message, Utf8Bytes};
+use tokio_tungstenite::tungstenite::{Bytes, Error, Message, Utf8Bytes};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use crate::util::{Outgoing, WebsocketOutgoing};
-use crate::websocket::WebsocketMessage;
+use crate::util::{Outgoing};
 
 #[derive(Debug)]
 pub struct WebsocketClient {
-    websocket_tx: OnceLock<mpsc::Sender<WebsocketOutgoing>>,
+    websocket_tx: OnceLock<mpsc::Sender<Outgoing<Message, Message>>>,
     handler: Arc<dyn ClientHandler>,
 }
 
@@ -41,7 +42,7 @@ impl WebsocketClient {
         Ok(ret)
     }
 
-    pub async fn send_ws_msg(&self, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
+    pub async fn send_ws_msg(&self, msg: Message) -> anyhow::Result<Message> {
         let (outgoing, ack) = Outgoing::new(msg);
 
         let websocket_tx = self.websocket_tx.get().ok_or_else(|| anyhow::anyhow!("Websocket not connected"))?;
@@ -51,7 +52,12 @@ impl WebsocketClient {
     }
 
     pub async fn shutdown(&self, reason: String) -> anyhow::Result<()> {
-        let (outgoing, ack) = Outgoing::new(WebsocketMessage::WorkerDisconnect(reason));
+        let frame = CloseFrame {
+            code: CloseCode::Normal,
+            reason: reason.into()
+        };
+
+        let (outgoing, ack) = Outgoing::new(Message::Close(Some(frame)));
 
         self.websocket_tx.get().unwrap().send(outgoing).await?;
 
@@ -63,7 +69,9 @@ impl WebsocketClient {
 
 #[async_trait]
 pub trait ClientHandler: Debug + Send + Sync + 'static {
-    async fn on_connected(&self, client: Arc<WebsocketClient>) -> anyhow::Result<()>;
+    async fn on_connected(&self, client: Arc<WebsocketClient>) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketClient>, ready_tx: oneshot::Sender<()>) -> anyhow::Result<()> {
@@ -103,7 +111,18 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
             res = rx.next() => {
                 match res {
                     Some(msg) => {
+                        match msg? {
+                            Message::Pong(_) => {}
+                            Message::Close(frame) => {
+                                warn!("Websocket connection closed by master: {:?}", frame);
+                                break;
+                            }
+                            _ => {
+                                //TODO: Handle msg
 
+                                tx.send(Message::Pong(Bytes::new())).await?;
+                            }
+                        }
                     }
                     None => {
                         warn!("Websocket connection closed by master.");
@@ -113,19 +132,14 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
             }
 
             Some(outgoing) = websocket_rx.recv() => {
-                let msg_str = serde_json::to_string(&outgoing.msg)?;
-                tx.send(Message::text(Utf8Bytes::from(msg_str))).await?;
+                tx.send(outgoing.msg).await?;
 
                 // always expect an ack for outgoing messages
                 let res = rx.next().await;
                 match res {
-                    Some(Ok(Message::Text(text))) => {
-                        let ws_msg: WebsocketMessage = serde_json::from_str(&text)?;
-                        outgoing.ack.send(Ok(ws_msg)).unwrap();
-                    }
-                    Some(Ok(_)) => {
+                    Some(Ok(msg)) => {
                         warn!("Unexpected non-text websocket message from master.");
-                        outgoing.ack.send(Err(anyhow::anyhow!("Unexpected message from master."))).unwrap();
+                        outgoing.ack.send(Ok(msg)).unwrap();
                     }
                     Some(Err(e)) => {
                         error!("Websocket error receiving ack from master: {}", e);

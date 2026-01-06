@@ -24,3 +24,5 @@ http = "*"
 url = "*"
 clap = { version = "*", features = ["derive"] }
 async-trait = "*"
+async-recursion = "*"
+sha2 = "*"

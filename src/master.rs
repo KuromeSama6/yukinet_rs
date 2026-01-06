@@ -154,6 +154,17 @@ impl ServerHandler for WebsocketHandler {
 
         Ok(())
     }
+
+    async fn on_msg(&self, server: Arc<WebsocketServer>, addr: SocketAddr, msg: Message) -> anyhow::Result<Option<Message>> {
+        Ok(None)
+    }
+
+    async fn on_disconnected(&self, server: Arc<WebsocketServer>, addr: SocketAddr) -> anyhow::Result<()> {
+        let worker = self.state.get_worker(addr).await.unwrap();
+        warn!("Worker disconnected: {addr}");
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]

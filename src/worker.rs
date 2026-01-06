@@ -17,6 +17,7 @@ use crate::websocket::WebsocketMessage;
 
 static STATE: OnceLock<Arc<WorkerState>> = OnceLock::new();
 
+
 pub async fn init() -> anyhow::Result<bool> {
     let config_file_path = "config/worker_config.json";
     if !fs::exists(config_file_path)? {
@@ -41,6 +42,10 @@ pub async fn init() -> anyhow::Result<bool> {
     }.into();
     STATE.set(state).unwrap();
 
+    info!("Begining resource verification phase of worker initialization.");
+    verify_resources().await?;
+    info!("Resource verification complete.");
+
     Ok(true)
 }
 
@@ -59,10 +64,32 @@ pub async fn shutdown() {
     STATE.get().unwrap().ws_client.shutdown("Worker shutting down".to_string()).await;
 }
 
-#[derive(Debug)]
-struct WebsocketClientHandler {
-    
+async fn verify_resources() -> anyhow::Result<()> {
+    let res = send_ws_msg(WebsocketMessage::ResourceRequestVerifyChecksums).await?;
+    let WebsocketMessage::ResourceVerifyChecksums(resources) = res else {
+        anyhow::bail!("ResourceVerifyChecksums failed");
+    };
+
+    Ok(())
 }
+
+async fn send_ws_msg(msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
+    let msg_str = serde_json::to_string(&msg)?;
+    let res = STATE.get().unwrap().ws_client.send_ws_msg(Message::Text(msg_str.into())).await?;
+
+    match res {
+        Message::Text(text) => {
+            let msg: WebsocketMessage = serde_json::from_str(&text)?;
+            Ok(msg)
+        }
+        _ => {
+            Err(anyhow::anyhow!("Unexpected response message type"))
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WebsocketClientHandler;
 
 #[async_trait]
 impl ClientHandler for WebsocketClientHandler {

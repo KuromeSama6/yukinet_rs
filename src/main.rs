@@ -13,10 +13,11 @@ mod util;
 mod console;
 mod error;
 mod master;
-mod resources;
 mod worker;
 mod websocket;
 mod command;
+mod resources;
+mod asyncutil;
 
 #[tokio::main]
 async fn main() {
@@ -64,13 +65,11 @@ fn run_setup() {
         info!("Default configuration files created at '{}'. Please review and modify them as needed before restarting the application.", config_dir_path);
         exit(0);
     }
-
-    // resources dir
-    fs::create_dir_all("resources").unwrap();
-
 }
 
 async fn init_modules() -> anyhow::Result<()> {
+    resources::init().await?;
+    
     let master_running = master::init().await?;
     if !master_running {
         info!("No master server is running. Running in worker-only mode.");

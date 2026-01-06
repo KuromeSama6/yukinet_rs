@@ -15,18 +15,17 @@ use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, RwLock};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot::Receiver;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Bytes, Message};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
-use crate::error::WebsocketError;
-use crate::error::WebsocketError::{AuthenticationFailure, ClientDisconnect, NotAuthenticated, Protocol, UnknownMessage};
-use crate::util::{Outgoing, WebsocketOutgoing};
-use crate::websocket::WebsocketMessage;
+use crate::util::{Outgoing};
 
 #[derive(Debug)]
 pub struct WebsocketServer {
     clients: RwLock<HashMap<SocketAddr, Client>>,
-    cmd_tx: UnboundedSender<WebsocketMessage>,
-    cmd_rx: UnboundedReceiver<WebsocketMessage>,
+    cmd_tx: UnboundedSender<Message>,
+    cmd_rx: UnboundedReceiver<Message>,
     shutdown: CancellationToken,
     handler: Arc<dyn ServerHandler>
 }
@@ -67,7 +66,7 @@ impl WebsocketServer {
         clients.get(&addr).cloned()
     }
 
-    pub async fn is_authenticated(&self, addr: &SocketAddr) -> bool {
+    pub async fn has_client(&self, addr: &SocketAddr) -> bool {
         let clients = self.clients.read().await;
 
         clients.contains_key(addr)
@@ -88,8 +87,18 @@ impl WebsocketServer {
 
 #[async_trait]
 pub trait ServerHandler: Debug + Send + Sync + 'static {
-    fn handle_header(&self, server: Arc<WebsocketServer>, req: &Request, res: Response) -> Result<Response, ErrorResponse>;
-    async fn on_connected(&self, server: Arc<WebsocketServer>, addr: SocketAddr) -> anyhow::Result<()>;
+    fn handle_header(&self, server: Arc<WebsocketServer>, req: &Request, res: Response) -> Result<Response, ErrorResponse> {
+        Ok(res)
+    }
+    async fn on_connected(&self, server: Arc<WebsocketServer>, addr: SocketAddr) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn on_msg(&self, server: Arc<WebsocketServer>, addr: SocketAddr, msg: Message) -> anyhow::Result<Option<Message>> {
+        Ok(None)
+    }
+    async fn on_disconnected(&self, server: Arc<WebsocketServer>, addr: SocketAddr) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 async fn websocket_loop(state: Arc<WebsocketServer>, addr: SocketAddr, ready_tx: oneshot::Sender<()>) -> anyhow::Result<()> {
@@ -148,19 +157,26 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
             Some(msg) = rx.next() => {
                 match msg {
                     Ok(msg) => {
-                        let res = websocket_handle_msg(state, addr, msg).await;
-                        match res {
-                            Ok(response_msg) => {
-                                let msg_str = serde_json::to_string(&response_msg)?;
-                                tx.send(Message::text(msg_str)).await?;
-                            }
-                            Err(ClientDisconnect(_)) => {
-                                warn!("Client requested disconnect: {addr}");
+                        match msg {
+                            Message::Pong(_) => {},
+                            Message::Close(frame) => {
+                                warn!("Websocket connection closed by client {addr}: {:?}", frame);
                                 break;
                             }
-                            Err(err) => {
-                                error!("Websocket error for addr {addr}: {err}");
-                                break;
+                            _ => {
+                                let res = state.handler.on_msg(state.clone(), addr, msg).await;
+                                match res {
+                                    Ok(Some(response_msg)) => {
+                                        tx.send(response_msg).await?;
+                                    }
+                                    Ok(None) => {
+                                        tx.send(Message::Pong(Bytes::new())).await?;
+                                    }
+                                    Err(err) => {
+                                        error!("Websocket error for addr {addr}: {err}");
+                                        break;
+                                    }
+                                }
                             }
                         }
 
@@ -174,19 +190,14 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
 
             Some(outgoing) = client_rx.recv() => {
                 let msg = outgoing.msg;
-                let msg_str = serde_json::to_string(&msg)?;
-                tx.send(Message::text(msg_str)).await?;
+                tx.send(msg).await?;
 
                 // always expect response
                 let res = rx.next().await;
                 match res {
-                    Some(Ok(Message::Text(text))) => {
-                        let ws_msg: WebsocketMessage = serde_json::from_str(&text)?;
-                        outgoing.ack.send(Ok(ws_msg)).unwrap();
-                    }
-                    Some(Ok(_)) => {
+                    Some(Ok(msg)) => {
                         warn!("Unexpected non-text websocket message from client.");
-                        outgoing.ack.send(Err(anyhow!("Unexpected non-text websocket message from client."))).unwrap();
+                        outgoing.ack.send(Ok(msg)).unwrap();
                     }
                     Some(Err(e)) => {
                         error!("Websocket error receiving response from client: {}", e);
@@ -215,63 +226,22 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
 
     warn!("Websocket client disconnected: {addr}");
     state.remove_client(&addr).await;
+    state.handler.on_disconnected(state.clone(), addr).await?;
 
     Ok(())
 }
 
-async fn websocket_handle_msg(state: Arc<WebsocketServer>, addr: SocketAddr, msg: Message) -> anyhow::Result<WebsocketMessage, WebsocketError> {
-    match msg {
-        Message::Text(text) => {
-            let msg: WebsocketMessage = serde_json::from_str(&text)?;
-
-            websocket_handle_msg_text(state, addr, msg).await
-        }
-
-        Message::Close(frame) => {
-            Err(ClientDisconnect(frame.unwrap().reason.to_string()))
-        }
-
-        _ => {
-            Err(UnknownMessage)
-        }
-    }
-}
-
-async fn websocket_handle_msg_text(state: Arc<WebsocketServer>, addr: SocketAddr, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage, WebsocketError> {
-    if !state.is_authenticated(&addr).await {
-        return Err(NotAuthenticated);
-    }
-
-    let client = state.get_client(addr).await.unwrap();
-
-    match msg {
-        WebsocketMessage::Ping => {
-            return Ok(WebsocketMessage::Ack);
-        }
-        WebsocketMessage::WorkerDisconnect(reason) => {
-            warn!("Worker at {addr} requested disconnect: {reason}");
-            return Err(ClientDisconnect(reason));
-        }
-        _ => {
-            warn!("Unexpected websocket message: {msg:?}");
-        }
-    }
-
-    info!("handle msg");
-    Ok(WebsocketMessage::Ack)
-}
-
-
 #[derive(Clone, Debug)]
 pub struct Client {
     addr: SocketAddr,
-    tx: Sender<WebsocketOutgoing>,
+    tx: Sender<Outgoing<Message, Message>>,
     close: Arc<CancellationToken>,
 }
 
 impl Client {
-    pub async fn send_ws_msg(&self, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
-        let (outgoing, rx) = WebsocketOutgoing::new(msg);
+    pub async fn send_ws_msg(&self, msg: Message) -> anyhow::Result<Message> {
+        let (outgoing, rx) = Outgoing::new(msg);
+
         self.tx.send(outgoing).await.map_err(|e| anyhow!("Failed to send websocket message to client: {}", e))?;
         let res = rx.await.map_err(|e| anyhow!("Failed to receive websocket response from client: {}", e))??;
 
@@ -279,7 +249,12 @@ impl Client {
     }
 
     pub async fn graceful_disconnect(&self, reason: &str) -> anyhow::Result<()> {
-        self.send_ws_msg(WebsocketMessage::WorkerDisconnect(reason.to_string())).await?;
+        let close_frame = CloseFrame {
+            code: CloseCode::Normal,
+            reason: reason.into(),
+        };
+
+        self.send_ws_msg(Message::Close(Some(close_frame))).await?;
         self.close.cancel();
 
         Ok(())
