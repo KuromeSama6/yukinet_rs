@@ -9,8 +9,9 @@ use futures_util::future::err;
 use futures_util::{SinkExt, StreamExt};
 use log::{error, info, warn};
 use crate::config::{MasterConfig};
-use tokio::net;
+use tokio::{net, task};
 use tokio::net::TcpListener;
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, RwLock};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot::Receiver;
@@ -20,10 +21,11 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
 use crate::util::{Outgoing};
+use crate::websocket::MessageRequest;
 
 #[derive(Debug)]
 pub struct WebsocketServer {
-    clients: RwLock<HashMap<SocketAddr, Client>>,
+    clients: RwLock<HashMap<SocketAddr, Arc<Client>>>,
     cmd_tx: UnboundedSender<Message>,
     cmd_rx: UnboundedReceiver<Message>,
     shutdown: CancellationToken,
@@ -60,7 +62,7 @@ impl WebsocketServer {
         Ok(ret)
     }
 
-    pub async fn get_client(&self, addr: SocketAddr) -> Option<Client> {
+    pub async fn get_client(&self, addr: SocketAddr) -> Option<Arc<Client>> {
         let clients = self.clients.read().await;
 
         clients.get(&addr).cloned()
@@ -75,7 +77,7 @@ impl WebsocketServer {
     pub async fn add_client(&self, client: Client) {
         let mut clients = self.clients.write().await;
 
-        clients.insert(client.addr, client);
+        clients.insert(client.addr, Arc::new(client));
     }
 
     pub async fn remove_client(&self, addr: &SocketAddr) {
@@ -87,7 +89,7 @@ impl WebsocketServer {
 
 #[async_trait]
 pub trait ServerHandler: Debug + Send + Sync + 'static {
-    fn handle_header(&self, server: Arc<WebsocketServer>, req: &Request, res: Response) -> Result<Response, ErrorResponse> {
+    async fn handle_header(&self, server: Arc<WebsocketServer>, addr: SocketAddr, req: &Request, res: Response) -> Result<Response, ErrorResponse> {
         Ok(res)
     }
     async fn on_connected(&self, server: Arc<WebsocketServer>, addr: SocketAddr) -> anyhow::Result<()> {
@@ -133,17 +135,21 @@ async fn websocket_loop(state: Arc<WebsocketServer>, addr: SocketAddr, ready_tx:
 async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAddr, stream: net::TcpStream) -> anyhow::Result<()> {
     let connect_headers: OnceCell<String> = OnceCell::new();
 
-    let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, res: Response| state.handler.handle_header(state.clone(), req, res)).await?;
+    let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, res: Response| websocket_handle_headers(state.clone(), addr.clone(), req, res)).await?;
 
     let (mut tx, mut rx) = ws.split();
 
     info!("Client connected: {addr}");
     let (client_tx, mut client_rx) = mpsc::channel(32);
+    let (client_tx_raw, mut client_rx_raw) = mpsc::channel(32);
+    
     let client_close = Arc::new(CancellationToken::new());
     let client = Client {
         addr,
         tx: client_tx,
+        tx_raw: client_tx_raw,
         close: client_close.clone(),
+        outbound_requests: RwLock::new(HashMap::new()),
     };
 
     state.add_client(client).await;
@@ -170,7 +176,7 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
                                         tx.send(response_msg).await?;
                                     }
                                     Ok(None) => {
-                                        tx.send(Message::Pong(Bytes::new())).await?;
+                                        // no response
                                     }
                                     Err(err) => {
                                         error!("Websocket error for addr {addr}: {err}");
@@ -212,6 +218,10 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
 
             }
 
+            Some(outbound_raw) = client_rx_raw.recv() => {
+                tx.send(outbound_raw).await?;
+            }
+            
             _ = client_close.cancelled() => {
                 tx.send(Message::Close(None)).await?;
                 break;
@@ -231,21 +241,41 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
     Ok(())
 }
 
-#[derive(Clone, Debug)]
+fn websocket_handle_headers(state: Arc<WebsocketServer>, addr: SocketAddr, req: &Request, res: Response) -> Result<Response, ErrorResponse> {
+    let handle = Handle::current();
+    let cstate = state.clone();
+
+    let ret = task::block_in_place(|| {
+        handle.block_on(async move {
+            cstate.handler.handle_header(cstate.clone(), addr, req, res).await
+        })
+    });
+
+    ret
+}
+
+#[derive(Debug)]
 pub struct Client {
     addr: SocketAddr,
     tx: Sender<Outgoing<Message, Message>>,
+    tx_raw: Sender<Message>,
+    outbound_requests: RwLock<HashMap<u64, MessageRequest>>,
     close: Arc<CancellationToken>,
 }
 
 impl Client {
-    pub async fn send_ws_msg(&self, msg: Message) -> anyhow::Result<Message> {
+    pub async fn send(&self, msg: Message) -> anyhow::Result<Message> {
         let (outgoing, rx) = Outgoing::new(msg);
 
-        self.tx.send(outgoing).await.map_err(|e| anyhow!("Failed to send websocket message to client: {}", e))?;
-        let res = rx.await.map_err(|e| anyhow!("Failed to receive websocket response from client: {}", e))??;
+        self.tx.send(outgoing).await?;
+        let res = rx.await??;
 
         Ok(res)
+    }
+
+    pub async fn send_raw(&self, msg: Message) -> anyhow::Result<()> {
+        self.tx_raw.send(msg).await?;
+        Ok(())
     }
 
     pub async fn graceful_disconnect(&self, reason: &str) -> anyhow::Result<()> {
@@ -254,7 +284,7 @@ impl Client {
             reason: reason.into(),
         };
 
-        self.send_ws_msg(Message::Close(Some(close_frame))).await?;
+        self.send(Message::Close(Some(close_frame))).await?;
         self.close.cancel();
 
         Ok(())

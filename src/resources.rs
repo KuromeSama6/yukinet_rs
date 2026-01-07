@@ -4,23 +4,37 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
+use tokio::fs::File;
+use tokio::io::BufReader;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use crate::asyncutil;
 use crate::util::Sha256Sum;
+
+pub type ChecksumMap = HashMap<String, Sha256Sum>;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Resource {
     pub path: String,
     pub checksum: Sha256Sum,
 
-    fingerprint: Fingerprint,
+    pub fingerprint: Fingerprint,
+}
+
+impl Resource {
+    pub async fn read_buf(&self) -> anyhow::Result<BufReader<File>> {
+        let path = Path::new("resources").join(&self.path);
+
+        debug!("read buf path: {}", path.display());
+        let file = File::open(path).await?;
+        Ok(BufReader::new(file))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct Fingerprint {
-    size: u64,
-    modified: u64,
+pub struct Fingerprint {
+    pub size: u64,
+    pub modified: u64,
 }
 
 impl Fingerprint {
@@ -63,9 +77,9 @@ pub async fn init() -> anyhow::Result<()> {
     info!("Creating resource map...");
     let sw = Instant::now();
     let base_path = Path::new("resources");
-    let fingerprints = &common_read_fingerprint_cache().await?;
-    let resource_map = common_map_resources(base_path, fingerprints).await?;
-    common_write_fingerprint_cache(&resource_map).await?;
+    let fingerprints = &read_fingerprint_cache().await?;
+    let resource_map = map_resources(base_path, fingerprints).await?;
+    write_fingerprint_cache(&resource_map).await?;
 
     info!("Resources mapped in {} seconds with {} resources.", &sw.elapsed().as_secs_f32(), &resource_map.len());
 
@@ -76,8 +90,48 @@ pub async fn init() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn checksum_map() -> ChecksumMap {
+    let resources = COMMON_STATE.get().unwrap().resources.read().await;
+    let mut ret = HashMap::new();
+
+    for (path, resource) in resources.iter() {
+        ret.insert(path.clone(), resource.checksum.clone());
+    }
+
+    ret
+}
+
+pub async fn diff_checksums(checksums: &ChecksumMap) -> Vec<String> {
+    let mut ret = Vec::new();
+    let resources = COMMON_STATE.get().unwrap().resources.read().await;
+
+    for (path, checksum) in checksums.iter() {
+        if let Some(resource) = resources.get(path) {
+            if &resource.checksum != checksum {
+                debug!("Resource '{}' checksum mismatch (expected: {:?}, got: {:?})", path, resource.checksum, checksum);
+                ret.push(path.clone());
+            }
+        } else {
+            debug!("Resource '{}' not found in local resources.", path);
+            ret.push(path.clone());
+        }
+    }
+
+    ret
+}
+
+pub async fn get_resource(path: &str) -> Option<Resource> {
+    let resources = COMMON_STATE.get().unwrap().resources.read().await;
+
+    if let Some(resource) = resources.get(path) {
+        Some(resource.clone())
+    } else {
+        None
+    }
+}
+
 #[async_recursion::async_recursion]
-async fn common_map_resources(base_path: &Path, fingerprints: &HashMap<String, Resource>) -> anyhow::Result<HashMap<String, Resource>> {
+async fn map_resources(base_path: &Path, fingerprints: &HashMap<String, Resource>) -> anyhow::Result<HashMap<String, Resource>> {
     let mut read_dir = fs::read_dir(base_path).await?;
     let mut ret = HashMap::new();
 
@@ -85,7 +139,7 @@ async fn common_map_resources(base_path: &Path, fingerprints: &HashMap<String, R
         let file_type = entry.file_type().await?;
         if file_type.is_dir() {
             let path = entry.path();
-            let child_map = common_map_resources(&path, &fingerprints).await?;
+            let child_map = map_resources(&path, &fingerprints).await?;
             ret.extend(child_map);
             continue;
         }
@@ -120,7 +174,7 @@ async fn common_map_resources(base_path: &Path, fingerprints: &HashMap<String, R
     Ok(ret)
 }
 
-async fn common_read_fingerprint_cache() -> anyhow::Result<HashMap<String, Resource>> {
+async fn read_fingerprint_cache() -> anyhow::Result<HashMap<String, Resource>> {
     let path = "cache/resource_fingerprints.json";
 
     let exists = fs::metadata(path).await.is_ok();
@@ -133,7 +187,7 @@ async fn common_read_fingerprint_cache() -> anyhow::Result<HashMap<String, Resou
     Ok(resources)
 }
 
-async fn common_write_fingerprint_cache(resources: &HashMap<String, Resource>) -> anyhow::Result<()> {
+async fn write_fingerprint_cache(resources: &HashMap<String, Resource>) -> anyhow::Result<()> {
     let serialized = serde_json::to_string(resources)?;
     fs::write("cache/resource_fingerprints.json", serialized).await?;
     Ok(())

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::{Bytes, Error, Message, Utf8Bytes};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -72,6 +72,9 @@ pub trait ClientHandler: Debug + Send + Sync + 'static {
     async fn on_connected(&self, client: Arc<WebsocketClient>) -> anyhow::Result<()> {
         Ok(())
     }
+    async fn on_msg(&self, client: Arc<WebsocketClient>, msg: Message) -> anyhow::Result<Option<Message>> {
+        Ok(None)
+    }
 }
 
 async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketClient>, ready_tx: oneshot::Sender<()>) -> anyhow::Result<()> {
@@ -102,7 +105,7 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
 
     ready_tx.send(()).unwrap();
 
-    info!("Websocket connection to master established at {}", uri);
+    info!("Websocket connection to server established at {}", uri);
 
     state.handler.on_connected(state.clone()).await?;
 
@@ -111,16 +114,21 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
             res = rx.next() => {
                 match res {
                     Some(msg) => {
-                        match msg? {
+                        let msg = msg?;
+                        match msg.clone() {
                             Message::Pong(_) => {}
                             Message::Close(frame) => {
                                 warn!("Websocket connection closed by master: {:?}", frame);
                                 break;
                             }
                             _ => {
-                                //TODO: Handle msg
+                                let response = state.handler.on_msg(state.clone(), msg).await?;
+                                if let Some(resp_msg) = response {
+                                    tx.send(resp_msg).await?;
 
-                                tx.send(Message::Pong(Bytes::new())).await?;
+                                } else {
+                                    tx.send(Message::Pong(Bytes::new())).await?;
+                                }
                             }
                         }
                     }
@@ -138,7 +146,6 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
                 let res = rx.next().await;
                 match res {
                     Some(Ok(msg)) => {
-                        warn!("Unexpected non-text websocket message from master.");
                         outgoing.ack.send(Ok(msg)).unwrap();
                     }
                     Some(Err(e)) => {

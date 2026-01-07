@@ -69,7 +69,7 @@ fn run_setup() {
 
 async fn init_modules() -> anyhow::Result<()> {
     resources::init().await?;
-    
+
     let master_running = master::init().await?;
     if !master_running {
         info!("No master server is running. Running in worker-only mode.");

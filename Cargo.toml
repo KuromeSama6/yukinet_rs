@@ -13,13 +13,13 @@ rand = "*"
 hex = "*"
 tokio = { version = "*", features = ["full"] }
 tokio-tungstenite = "*"
+tokio-util = "*"
 inquire = "*"
 anyhow = "*"
 futures-util = "*"
 uuid = {  version = "*", features = ["fast-rng", "v7", "v4"] }
 thiserror = "*"
 once_cell = "*"
-tokio-util = "*"
 http = "*"
 url = "*"
 clap = { version = "*", features = ["derive"] }
