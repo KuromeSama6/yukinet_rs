@@ -1,18 +1,19 @@
+pub mod buf;
+
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
-use crate::websocket::WebsocketMessage;
 
-pub struct Outgoing<TRes, TAck> {
+pub struct Outgoing<TRes> {
     pub msg: TRes,
-    pub ack: oneshot::Sender<anyhow::Result<TAck>>
+    pub ack: oneshot::Sender<anyhow::Result<()>>
 }
 
-impl<TRes, TAck> Outgoing<TRes, TAck> {
-    pub fn new(msg: TRes) -> (Self, oneshot::Receiver<anyhow::Result<TAck>>) {
+impl<TRes> Outgoing<TRes> {
+    pub fn new(msg: TRes) -> (Self, oneshot::Receiver<anyhow::Result<()>>) {
         let (tx, rx) = oneshot::channel();
         let ret = Outgoing {
             msg,

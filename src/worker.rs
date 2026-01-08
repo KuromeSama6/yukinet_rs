@@ -1,7 +1,9 @@
 use std::fs;
+use std::io::Cursor;
 use std::sync::{Arc, OnceLock, RwLock};
 use anyhow::{bail, Context};
 use async_trait::async_trait;
+use clap::builder::Str;
 use futures_util::{SinkExt, StreamExt};
 use http::Request;
 use log::{debug, error, info, warn};
@@ -12,9 +14,10 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
 use crate::config::{WorkerConfig};
 use crate::{master, resources};
+use crate::message::WebsocketMessage;
 use crate::util::{Outgoing};
+use crate::util::buf::{EzReader, EzWriteBuf};
 use crate::websocket::client::{ClientHandler, WebsocketClient};
-use crate::websocket::WebsocketMessage;
 
 
 static STATE: OnceLock<Arc<WorkerState>> = OnceLock::new();
@@ -37,6 +40,7 @@ pub async fn init() -> anyhow::Result<bool> {
 
     let handler = WebsocketClientHandler { };
     let ws_client = WebsocketClient::connect(request, handler).await?;
+    let cws_client = ws_client.clone();
 
     let state: Arc<WorkerState> = WorkerState {
         config,
@@ -67,13 +71,12 @@ pub async fn shutdown() {
     }
 
     info!("Worker shutting down...");
-    info!("Note - Websocket errors during shutdown are expected.");
 
     STATE.get().unwrap().ws_client.shutdown("Worker shutting down".to_string()).await;
 }
 
 async fn verify_resources() -> anyhow::Result<()> {
-    let res = send_ws_msg(WebsocketMessage::ResourceRequestChecksums).await?;
+    let res = ws_request(WebsocketMessage::ResourceRequestChecksums).await?;
     let WebsocketMessage::ResourceVerifyChecksums(checksums) = res else {
         anyhow::bail!("ResourceVerifyChecksums failed");
     };
@@ -96,7 +99,7 @@ async fn update_resource(path: &str) -> anyhow::Result<()> {
     info!("Update resource: {path}");
 
     debug!("step 1");
-    let WebsocketMessage::ResourceBeginDownload {len, path, checksum} = send_ws_msg(WebsocketMessage::ResourceRequestDownload(path.to_string())).await? else {
+    let WebsocketMessage::ResourceBeginDownload {len, path, checksum} = ws_request(WebsocketMessage::ResourceRequestDownload(path.to_string())).await? else {
         bail!("ResourceRequestDownload failed");
     };
     debug!("step 2");
@@ -110,7 +113,7 @@ async fn update_resource(path: &str) -> anyhow::Result<()> {
     STATE.get().unwrap().resource_download_rx.write().unwrap().replace(download);
 
     debug!("step 3");
-    send_ws_msg(WebsocketMessage::ResourceStartTransfer).await?;
+    ws_send(WebsocketMessage::ResourceStartTransfer).await?;
 
     debug!("step 4");
     rx.await?;
@@ -119,26 +122,40 @@ async fn update_resource(path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn send_ws_msg(msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
-    let msg_str = serde_json::to_string(&msg)?;
-    let res = STATE.get().unwrap().ws_client.send_ws_msg(Message::Text(msg_str.into())).await?;
+async fn ws_send(msg: WebsocketMessage) -> anyhow::Result<()> {
+    STATE.get().unwrap().ws_client.send_json(&msg).await?;
 
-    match res {
-        Message::Text(text) => {
-            let msg: WebsocketMessage = serde_json::from_str(&text)?;
-            Ok(msg)
-        }
-        _ => {
-            Err(anyhow::anyhow!("Unexpected response message type {:?}", res))
-        }
-    }
+    Ok(())
 }
 
-async fn handle_ws_msg(msg: WebsocketMessage) -> anyhow::Result<Option<WebsocketMessage>> {
+async fn ws_request(msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
+    let res = STATE.get().unwrap().ws_client.request_json(&msg).await?;
+
+    Ok(res)
+}
+
+async fn handle_ws_msg(msg: WebsocketMessage) -> anyhow::Result<()> {
     match msg {
+        WebsocketMessage::Ping => {
+            debug!("ping from master");
+        }
+
         _ => {
-            warn!("Unhandled master websocket message: {:?}", msg);
-            Ok(None)
+            bail!("Unhandled master websocket message: {:?}", msg);
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_ws_request(msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
+    match msg {
+        WebsocketMessage::Ping => {
+            debug!("ping request from master");
+            Ok(WebsocketMessage::Ack)
+        }
+        _ => {
+            bail!("Unhandled master websocket request: {:?}", msg);
         }
     }
 }
@@ -153,42 +170,28 @@ impl ClientHandler for WebsocketClientHandler {
         Ok(())
     }
 
-    async fn on_msg(&self, client: Arc<WebsocketClient>, msg: Message) -> anyhow::Result<Option<Message>> {
-        debug!("on_msg {:?}", msg);
+    async fn on_msg(&self, client: Arc<WebsocketClient>, msg: String) -> anyhow::Result<()> {
+        let msg = serde_json::from_str(&msg)?;
+        handle_ws_msg(msg).await?;
 
-        match msg {
-            Message::Text(text) => {
-                let msg = serde_json::from_str(text.as_str())?;
+        Ok(())
+    }
 
-                let res =  handle_ws_msg(msg).await?;
-                match res {
-                    Some(res) => {
-                        let res_str = serde_json::to_string(&res)?;
-                        Ok(Some(Message::Text(res_str.into())))
-                    }
-                    None => Ok(None),
-                }
-            }
-            Message::Binary(data) => {
-                let state = STATE.get().unwrap();
+    async fn on_request(&self, client: Arc<WebsocketClient>, msg: String) -> anyhow::Result<String> {
+        let msg = serde_json::from_str(&msg)?;
+        let res = handle_ws_request(msg).await?;
 
-                {
-                    let dl = state.resource_download_rx.read().unwrap();
-                    if let Some(download) = &*dl {
-                        debug!("Received file chunk for {}, len={}", download.path, data.len());
+        Ok(serde_json::to_string(&res)?)
+    }
 
-                        return Ok(None);
-                    }
-                }
+    async fn on_msg_bin(&self, client: Arc<WebsocketClient>, msg: &mut EzReader<Cursor<Vec<u8>>>) -> anyhow::Result<()> {
 
-                warn!("Received unexpected binary websocket message of length {}", data.len());
-                Ok(None)
-            }
-            _ => {
-                warn!("Unsupported websocket message: {:?} ", msg);
-                Ok(None)
-            }
-        }
+        Ok(())
+    }
+
+    async fn on_request_bin(&self, client: Arc<WebsocketClient>, msg: &mut EzReader<Cursor<Vec<u8>>>, res: &mut EzWriteBuf) -> anyhow::Result<()> {
+
+        Ok(())
     }
 }
 

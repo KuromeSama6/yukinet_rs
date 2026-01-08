@@ -1,7 +1,8 @@
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::fmt::format;
+use std::fmt::{format, Display, Formatter};
 use std::fs::{exists, File};
+use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
@@ -23,11 +24,12 @@ use tokio_util::sync::CancellationToken;
 use crate::error::WebsocketError;
 use crate::error::WebsocketError::{AuthenticationFailure, ClientDisconnect, NotAuthenticated, Protocol, UnknownMessage};
 use crate::master::MasterCommand::Shutdown;
+use crate::message::WebsocketMessage;
 use crate::resources;
 use crate::resources::Resource;
+use crate::util::buf::{EzReader, EzWriteBuf};
 use crate::util::Outgoing;
 use crate::websocket::server::{Client, ServerHandler, WebsocketServer};
-use crate::websocket::{WebsocketMessage, WebsocketOutgoing};
 
 static RESOURCE_CHUNK_SIZE: usize = 1024 * 32;
 
@@ -58,7 +60,7 @@ pub async fn init() -> anyhow::Result<bool> {
 
     let ws_server = WebsocketServer::start_new(&addr, handler).await?;
     WEBSOCKET.set(ws_server).unwrap();
-    
+
     Ok(true)
 }
 
@@ -75,7 +77,7 @@ pub async fn shutdown() {
     master_send_cmd(Shutdown).await;
 }
 
-async fn master_command_loop(state: Arc<MasterState>, mut cmd_rx: mpsc::Receiver<Outgoing<MasterCommand, ()>>) {
+async fn master_command_loop(state: Arc<MasterState>, mut cmd_rx: mpsc::Receiver<Outgoing<MasterCommand>>) {
     while let Some(outgoing) = cmd_rx.recv().await {
         match outgoing.msg {
             Shutdown => {
@@ -101,58 +103,33 @@ async fn master_send_cmd(cmd: MasterCommand) -> anyhow::Result<()> {
     ack.await?
 }
 
-async fn handle_ws_msg(worker: Arc<Worker>, msg: WebsocketMessage) -> anyhow::Result<Option<WebsocketMessage>> {
+async fn handle_ws_msg(worker: Arc<Worker>, msg: WebsocketMessage) -> anyhow::Result<()> {
     match msg {
-        WebsocketMessage::ResourceRequestChecksums => {
-            let map = resources::checksum_map().await;
-
-            Ok(Some(WebsocketMessage::ResourceVerifyChecksums(map)))
+        WebsocketMessage::Ping => {
+            debug!("ping from worker {:?}", worker);
         }
-
-        WebsocketMessage::ResourceRequestDownload(path) => {
-            let resource = resources::get_resource(path.as_str()).await;
-            if resource.is_none() {
-                warn!("Worker {} requested unknown resource: {}", worker.addr, path);
-                bail!("Unknown resource requested");
-            }
-            let resource = resource.unwrap();
-
-            let ret = WebsocketMessage::ResourceBeginDownload {
-                len: resource.fingerprint.size,
-                path: path.clone(),
-                checksum: resource.checksum.clone()
-            };
-
-            worker.set_res_download(path.clone()).await?;
-
-            info!("Worker {} requested resource download: {}", worker.addr, path);
-            Ok(Some(ret))
+        _ => {
+            bail!("Received unknown message from worker {}: {:?}", worker.addr, msg);
         }
+    }
 
-        WebsocketMessage::ResourceStartTransfer => {
-            debug!("worker {}: start resource transfer", worker.addr);
-            let current_download = worker.current_download.read().await;
-            if current_download.is_none() {
-                warn!("Worker {} requested resource transfer without a pending download.", worker.addr);
-                bail!("No pending download");
-            }
+    Ok(())
+}
 
-            debug!("step 1");
-            worker.send_dct(WebsocketMessage::Ack).await?;
-            debug!("step 2");
-            worker.transfer_resource().await?;
-            debug!("step 3");
-
-            Ok(Some(WebsocketMessage::Nop))
+async fn handle_ws_request(worker: Arc<Worker>, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
+    match msg {
+        WebsocketMessage::Ping => {
+            debug!("ping request from worker {}", worker);
+            Ok(WebsocketMessage::Ack)
         }
 
         _ => {
-            warn!("Received unknown message from worker {}: {:?}", worker.addr, msg);
-
-            Ok(None)
+            warn!("Received unknown request from worker {}: {:?}", worker.addr, msg);
+            bail!("Unknown request");
         }
     }
 }
+
 
 #[derive(Debug)]
 struct WebsocketHandler {
@@ -220,35 +197,33 @@ impl ServerHandler for WebsocketHandler {
         Ok(())
     }
 
-    async fn on_msg(&self, server: Arc<WebsocketServer>, addr: SocketAddr, msg: Message) -> anyhow::Result<Option<Message>> {
+    async fn on_msg(&self, server: Arc<WebsocketServer>, addr: SocketAddr, msg: String) -> anyhow::Result<()> {
         let worker = self.state.get_worker(addr).await.unwrap();
+        let msg: WebsocketMessage = serde_json::from_str(&msg)?;
 
-        match msg {
-            Message::Text(text) => {
-                let msg: WebsocketMessage = serde_json::from_str(&text)?;
-                let resp = handle_ws_msg(worker, msg).await?;
-                if let Some(resp_msg) = resp {
-                    if let WebsocketMessage::Nop = resp_msg {
-                        // special case: Nop means no response
-                        return Ok(None);
-                    }
-                    
-                    let resp_text = serde_json::to_string(&resp_msg)?;
-                    return Ok(Some(Message::Text(resp_text.into())));
+        handle_ws_msg(worker, msg).await?;
 
-                } else {
-                    return Ok(Some(Message::Pong(Bytes::new())));
-                }
-            }
-            _ => {
-                warn!("Received unsupported message type from worker {}: {:?}", addr, msg);
-            }
-        }
-
-        Ok(Some(Message::Pong(Bytes::new())))
+        Ok(())
     }
 
-    async fn on_disconnected(&self, server: Arc<WebsocketServer>, addr: SocketAddr) -> anyhow::Result<()> {
+    async fn on_request(&self, server: Arc<WebsocketServer>, addr: SocketAddr, msg: String) -> anyhow::Result<String> {
+        let worker = self.state.get_worker(addr).await.unwrap();
+        let msg: WebsocketMessage = serde_json::from_str(&msg)?;
+
+        let res = handle_ws_request(worker, msg).await?;
+
+        Ok(serde_json::to_string(&res)?)
+    }
+
+    async fn on_msg_bin(&self, server: Arc<WebsocketServer>, addr: SocketAddr, msg: &mut EzReader<Cursor<Vec<u8>>>) -> anyhow::Result<()> {
+        bail!("Received unexpected binary message from worker: {}", addr);
+    }
+
+    async fn on_request_bin(&self, server: Arc<WebsocketServer>, addr: SocketAddr, msg: &mut EzReader<Cursor<Vec<u8>>>, res: &mut EzWriteBuf) -> anyhow::Result<()> {
+        bail!("Received unexpected binary request from worker: {}", addr);
+    }
+
+    async fn on_disconnect(&self, server: Arc<WebsocketServer>, addr: SocketAddr) -> anyhow::Result<()> {
         let worker = self.state.get_worker(addr).await.unwrap();
         warn!("Worker disconnected: {addr}");
 
@@ -260,12 +235,12 @@ impl ServerHandler for WebsocketHandler {
 struct MasterState {
     config: MasterConfig,
     workers: RwLock<HashMap<SocketAddr, Arc<Worker>>>,
-    cmd_tx: Sender<Outgoing<MasterCommand, ()>>,
+    cmd_tx: Sender<Outgoing<MasterCommand>>,
     shutdown: CancellationToken
 }
 
 impl MasterState {
-    pub fn new(config: MasterConfig, cmd_tx: Sender<Outgoing<MasterCommand, ()>>) -> Self {
+    pub fn new(config: MasterConfig, cmd_tx: Sender<Outgoing<MasterCommand>>) -> Self {
         MasterState {
             config,
             workers: RwLock::new(HashMap::new()),
@@ -328,31 +303,21 @@ impl Worker {
 
         ret
     }
-    
-    pub async fn send(&self, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
-        let msg_text = serde_json::to_string(&msg)?;
-        let msg = Message::Text(msg_text.into());
-        
-        let websocket = WEBSOCKET.get().unwrap();
-        let res = websocket.get_client(self.addr).await.unwrap().send(msg).await?;
-        
-        let Message::Text(text) = res else {
-            bail!("Unexpected response message type");
-        };
-        
-        Ok(serde_json::from_str(text.as_str())?)
-    }
 
-    pub async fn send_dct(&self, msg: WebsocketMessage) -> anyhow::Result<()> {
-        let msg_text = serde_json::to_string(&msg)?;
-        let msg = Message::Text(msg_text.into());
-        
+    pub async fn send(&self, msg: WebsocketMessage) -> anyhow::Result<()> {
         let websocket = WEBSOCKET.get().unwrap();
-        websocket.get_client(self.addr).await.unwrap().send_raw(msg).await?;
-        
+        websocket.get_client(self.addr).await.unwrap().send_json(&msg).await?;
+
         Ok(())
     }
-    
+
+    pub async fn request(&self, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
+        let websocket = WEBSOCKET.get().unwrap();
+        let res = websocket.get_client(self.addr).await.unwrap().request_json(&msg).await?;
+
+        Ok(res)
+    }
+
     pub async fn set_res_download(&self, path: String) -> anyhow::Result<()> {
         let mut write = self.current_download.write().await;
         *write = Some(path);
@@ -371,19 +336,19 @@ impl Worker {
         let mut buf = [0u8; RESOURCE_CHUNK_SIZE];
 
         let mut count = 0usize;
-        
+
         debug!("{}: Total {} bytes to send", path, resource.fingerprint.size);
-        
+
         loop {
             let n = reader.read(&mut buf).await?;
             count += n;
-            
+
             debug!("Sent {} / {} bytes ({} %)", count, resource.fingerprint.size, (count as f64 / resource.fingerprint.size as f64) * 100.0);
-            
+
             if count >= resource.fingerprint.size as usize {
                 break;
             }
-            
+
             if n == 0 {
                 warn!("Unexpected EOF while reading resource file: {}", path);
                 bail!("IO Error");
@@ -401,6 +366,12 @@ impl Worker {
         *write = None;
 
         Ok(())
+    }
+}
+
+impl Display for Worker {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Worker {{ id: {}, addr: {} }}", self.id, self.addr)
     }
 }
 

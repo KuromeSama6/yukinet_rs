@@ -18,6 +18,7 @@ mod websocket;
 mod command;
 mod resources;
 mod asyncutil;
+mod message;
 
 #[tokio::main]
 async fn main() {
@@ -30,7 +31,7 @@ async fn main() {
 
     let init_systems_ok = init_modules().await;
     if let Err(e) = init_systems_ok {
-        error!("Failed to initialize service modules: {}", e);
+        error!("Failed to initialize service modules: {:+#}", e);
         exit(1);
     }
 
