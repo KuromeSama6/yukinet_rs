@@ -6,6 +6,7 @@ use std::io::Cursor;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use futures_util::future::err;
@@ -13,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use tokio::io::AsyncReadExt;
 use crate::config::{MasterConfig};
-use tokio::net;
+use tokio::{net, time};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, OnceCell, RwLock};
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
@@ -108,6 +109,23 @@ async fn handle_ws_msg(worker: Arc<Worker>, msg: WebsocketMessage) -> anyhow::Re
         WebsocketMessage::Ping => {
             debug!("ping from worker {:?}", worker);
         }
+
+        WebsocketMessage::ResourceStartTransfer => {
+            let current_download = worker.current_download.read().await;
+            if current_download.is_none() {
+                bail!("Worker {} requested resource transfer without a pending download.", worker.addr);
+            }
+
+            let cworker = worker.clone();
+            tokio::spawn(async move {
+                cworker.transfer_resource().await;
+            });
+        }
+
+        WebsocketMessage::ResourceFinishTransfer => {
+            worker.clear_res_download().await?;
+        }
+
         _ => {
             bail!("Received unknown message from worker {}: {:?}", worker.addr, msg);
         }
@@ -119,8 +137,32 @@ async fn handle_ws_msg(worker: Arc<Worker>, msg: WebsocketMessage) -> anyhow::Re
 async fn handle_ws_request(worker: Arc<Worker>, msg: WebsocketMessage) -> anyhow::Result<WebsocketMessage> {
     match msg {
         WebsocketMessage::Ping => {
-            debug!("ping request from worker {}", worker);
             Ok(WebsocketMessage::Ack)
+        }
+
+        WebsocketMessage::ResourceRequestChecksums => {
+            let map = resources::checksum_map().await;
+
+            Ok(WebsocketMessage::ResourceVerifyChecksums(map))
+        }
+
+        WebsocketMessage::ResourceRequestDownload(path) => {
+            let resource = resources::get_resource(path.as_str()).await;
+            if resource.is_none() {
+                warn!("Worker {} requested unknown resource: {}", worker.addr, path);
+                bail!("Unknown resource requested");
+            }
+            let resource = resource.unwrap();
+
+            let ret = WebsocketMessage::ResourceBeginDownload {
+                len: resource.fingerprint.size,
+                path: path.clone(),
+                checksum: resource.checksum.clone()
+            };
+
+            worker.set_res_download(path.clone()).await?;
+
+            Ok(ret)
         }
 
         _ => {
@@ -337,25 +379,22 @@ impl Worker {
 
         let mut count = 0usize;
 
-        debug!("{}: Total {} bytes to send", path, resource.fingerprint.size);
+        let websocket = WEBSOCKET.get().unwrap().get_client(self.addr).await.unwrap();
 
         loop {
             let n = reader.read(&mut buf).await?;
             count += n;
 
-            debug!("Sent {} / {} bytes ({} %)", count, resource.fingerprint.size, (count as f64 / resource.fingerprint.size as f64) * 100.0);
+            let chunk = buf[..n].to_vec();
+            websocket.send_binary(chunk).await?;
 
             if count >= resource.fingerprint.size as usize {
                 break;
             }
 
             if n == 0 {
-                warn!("Unexpected EOF while reading resource file: {}", path);
-                bail!("IO Error");
+                bail!("Unexpected EOF while reading resource file: {}", path);
             }
-
-            let chunk = buf[..n].to_vec();
-            let msg = Message::binary(chunk);
         }
 
         Ok(())

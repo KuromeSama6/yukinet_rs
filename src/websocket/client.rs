@@ -16,14 +16,13 @@ use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use crate::util::{Outgoing};
 use crate::util::buf::{EzReader, EzWriteBuf};
 use crate::websocket::codec::{MessageBinary, MessageText};
 use crate::websocket::{codec, MessageRequest};
 
 #[derive(Debug)]
 pub struct WebsocketClient {
-    websocket_tx: OnceLock<mpsc::Sender<Outgoing<Message>>>,
+    websocket_tx: OnceLock<mpsc::Sender<Message>>,
     handler: Arc<dyn ClientHandler>,
     outbound_requests: RwLock<HashMap<u64, MessageRequest>>,
 }
@@ -61,9 +60,7 @@ impl WebsocketClient {
         };
         let msg = Message::Text(serde_json::to_string(&msg)?.into());
 
-        let (outgoing, ack) = Outgoing::new(msg);
-        self.websocket_tx.get().unwrap().send(outgoing).await?;
-        ack.await?;
+        self.websocket_tx.get().unwrap().send(msg).await?;
 
         Ok(())
     }
@@ -78,7 +75,6 @@ impl WebsocketClient {
         };
         let msg = Message::Text(serde_json::to_string(&msg)?.into());
 
-        let (outgoing, ack) = Outgoing::new(msg);
         let req_id = req.id;
 
         {
@@ -86,8 +82,7 @@ impl WebsocketClient {
             requests.insert(req_id, req);
         }
 
-        self.websocket_tx.get().unwrap().send(outgoing).await?;
-        ack.await?;
+        self.websocket_tx.get().unwrap().send(msg).await?;
 
         let res = rx.await?;
 
@@ -113,9 +108,7 @@ impl WebsocketClient {
         };
         let msg = Message::Binary(msg.serialize()?.into());
 
-        let (outgoing, ack) = Outgoing::new(msg);
-        self.websocket_tx.get().unwrap().send(outgoing).await?;
-        ack.await?;
+        self.websocket_tx.get().unwrap().send(msg).await?;
 
         Ok(())
     }
@@ -129,7 +122,6 @@ impl WebsocketClient {
         };
         let msg = Message::Binary(msg.serialize()?.into());
 
-        let (outgoing, ack) = Outgoing::new(msg);
         let req_id = req.id;
 
         {
@@ -137,8 +129,7 @@ impl WebsocketClient {
             requests.insert(req_id, req);
         }
 
-        self.websocket_tx.get().unwrap().send(outgoing).await?;
-        ack.await?;
+        self.websocket_tx.get().unwrap().send(msg).await?;
 
         let res = rx.await?;
 
@@ -161,12 +152,8 @@ impl WebsocketClient {
             code: CloseCode::Normal,
             reason: reason.into()
         };
-
-        let (outgoing, ack) = Outgoing::new(Message::Close(Some(frame)));
-
-        self.websocket_tx.get().unwrap().send(outgoing).await?;
-
-        ack.await?;
+        
+        self.websocket_tx.get().unwrap().send(Message::Close(Some(frame))).await?;
 
         Ok(())
     }
@@ -268,13 +255,13 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
                                     let _ = req.tx.send(msg);
 
                                 } else {
-                                    let mut reader = inbound.consume_reader();
+                                    let mut reader = inbound.to_reader();
 
                                     if id != 0 {
                                         // send request
                                         let mut res_buf = EzWriteBuf::default();
                                         state.handler.on_request_bin(state.clone(), &mut reader, &mut res_buf).await?;
-                                        let res_data = res_buf.consume_bytes();
+                                        let res_data = res_buf.to_bytes();
 
                                         let res = MessageBinary {
                                             id,
@@ -309,9 +296,8 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
                 }
             }
 
-            Some(outgoing) = outbound_rx.recv() => {
-                tx.send(outgoing.msg).await?;
-                outgoing.ack.send(Ok(())).unwrap();
+            Some(msg) = outbound_rx.recv() => {
+                tx.send(msg).await?;
             }
         }
     }

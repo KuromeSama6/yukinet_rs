@@ -54,6 +54,7 @@ impl <T: Read> EzReader<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct EzWriteBuf {
     buf: Vec<u8>
 }
@@ -67,6 +68,10 @@ impl Default for EzWriteBuf {
 }
 
 impl EzWriteBuf {
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
     pub fn write_u8(&mut self, value: u8) -> anyhow::Result<()> {
         self.buf.push(value);
         Ok(())
@@ -102,7 +107,21 @@ impl EzWriteBuf {
         Ok(())
     }
 
-    pub fn consume_bytes(self) -> Vec<u8> {
+    pub fn write_reader(&mut self, reader: &mut EzReader<impl Read>, len: usize) -> anyhow::Result<()> {
+        let mut buf = vec![0u8; len];
+        reader.read_exact(&mut buf)?;
+        self.buf.extend_from_slice(&buf);
+        Ok(())
+    }
+
+    pub fn write_reader_all(&mut self, reader: &mut EzReader<impl Read>) -> anyhow::Result<()> {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        self.buf.extend_from_slice(&buf);
+        Ok(())
+    }
+
+    pub fn to_bytes(self) -> Vec<u8> {
         self.buf
     }
 }

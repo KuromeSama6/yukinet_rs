@@ -6,7 +6,6 @@ use crate::util::Sha256Sum;
 pub enum WebsocketMessage {
     Ping,
     Ack,
-    Nop,
 
     ResourceRequestChecksums,
     ResourceVerifyChecksums(ChecksumMap),
@@ -17,6 +16,7 @@ pub enum WebsocketMessage {
         checksum: Sha256Sum,
     },
     ResourceStartTransfer,
+    ResourceFinishTransfer,
 
     WorkerDisconnect(String),
 }

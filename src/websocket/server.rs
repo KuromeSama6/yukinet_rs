@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use futures_util::future::err;
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use crate::config::{MasterConfig};
@@ -26,7 +26,6 @@ use tokio_util::bytes::Buf;
 use tokio_util::bytes::buf::Reader;
 use tokio_util::sync::CancellationToken;
 use crate::message::WebsocketMessage;
-use crate::util::{Outgoing};
 use crate::util::buf::{EzReader, EzWriteBuf};
 use crate::websocket::{codec, MessageRequest};
 use crate::websocket::codec::{MessageBinary, MessageText};
@@ -147,11 +146,11 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
 
     let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, res: Response| websocket_handle_headers(state.clone(), addr.clone(), req, res)).await?;
 
-    let (mut tx, mut rx) = ws.split();
+    let (mut tx, mut rx) = ws.buffer(1024).split();
 
     info!("Client connected: {addr}");
     let (client_tx, mut client_rx) = mpsc::channel(32);
-    
+
     let client_close = Arc::new(CancellationToken::new());
     let client = Arc::new(Client {
         addr,
@@ -217,7 +216,7 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
                                     req.tx.send(cmsg);
 
                                 } else {
-                                    let mut data_reader = inbound.consume_reader();
+                                    let mut data_reader = inbound.to_reader();
 
                                     if inbound_id != 0 {
                                         // wants a response
@@ -227,7 +226,7 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
                                         let outbound = MessageBinary {
                                             id: inbound_id,
                                             response: true,
-                                            data: res.consume_bytes(),
+                                            data: res.to_bytes(),
                                         };
 
                                         tx.send(Message::Binary(outbound.serialize()?.into())).await?
@@ -258,12 +257,10 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
                 }
             }
 
-            Some(outgoing) = client_rx.recv() => {
-                let msg = outgoing.msg;
+            Some(msg) = client_rx.recv() => {
                 tx.send(msg).await?;
-                outgoing.ack.send(Ok(())).unwrap();
             }
-            
+
             _ = client_close.cancelled() => {
                 tx.send(Message::Close(None)).await?;
                 break;
@@ -299,7 +296,7 @@ fn websocket_handle_headers(state: Arc<WebsocketServer>, addr: SocketAddr, req: 
 #[derive(Debug)]
 pub struct Client {
     addr: SocketAddr,
-    tx: Sender<Outgoing<Message>>,
+    tx: Sender<Message>,
     outbound_requests: RwLock<HashMap<u64, MessageRequest>>,
     close: Arc<CancellationToken>,
 }
@@ -314,10 +311,7 @@ impl Client {
         };
 
         let text = serde_json::to_string(&outbound)?;
-        let (outgoing, ack) = Outgoing::new(Message::Text(text.into()));
-
-        self.tx.send(outgoing).await?;
-        ack.await?;
+        self.tx.send(Message::Text(text.into())).await?;
 
         Ok(())
     }
@@ -333,17 +327,21 @@ impl Client {
         };
 
         let text = serde_json::to_string(&outbound)?;
-        let (outgoing, ack) = Outgoing::new(Message::Text(text.into()));
-
-        self.tx.send(outgoing).await?;
-        ack.await?;
+        self.tx.send(Message::Text(text.into())).await?;
 
         let id = req.id;
-        self.outbound_requests.write().await
-            .insert(id, req);
+
+        {
+            let mut write = self.outbound_requests.write().await;
+            write.insert(id, req);
+        }
 
         let msg = rx.await?;
-        self.outbound_requests.write().await.remove(&id);
+
+        {
+            let mut write = self.outbound_requests.write().await;
+            write.remove(&id);
+        }
 
         let Message::Text(text) = msg else {
             bail!("request_json expects a text response");
@@ -357,18 +355,15 @@ impl Client {
     }
 
     pub async fn send_binary(&self, data: Vec<u8>) -> anyhow::Result<()> {
-        let (req, rx) = MessageRequest::new();
         let outbound = MessageBinary {
-            id: req.id,
+            id: 0,
             response: false,
             data
         };
 
         let bytes = outbound.serialize()?;
-        let (outgoing, ack) = Outgoing::new(Message::Binary(bytes.into()));
 
-        self.tx.send(outgoing).await?;
-        ack.await?;
+        self.tx.send(Message::Binary(bytes.into())).await?;
 
         Ok(())
     }
@@ -382,10 +377,8 @@ impl Client {
         };
 
         let bytes = outbound.serialize()?;
-        let (outgoing, ack) = Outgoing::new(Message::Binary(bytes.into()));
 
-        self.tx.send(outgoing).await?;
-        ack.await?;
+        self.tx.send(Message::Binary(bytes.into())).await?;
 
         let id = req.id;
         self.outbound_requests.write().await
@@ -409,10 +402,7 @@ impl Client {
             reason: reason.into(),
         };
 
-        let (outgoing, ack) = Outgoing::new(Message::Close(Some(close_frame)));
-
-        self.tx.send(outgoing).await?;
-        ack.await?;
+        self.tx.send(Message::Close(Some(close_frame))).await?;
 
         self.close.cancel();
 

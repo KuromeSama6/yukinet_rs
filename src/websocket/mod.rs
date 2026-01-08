@@ -2,15 +2,11 @@ pub mod server;
 pub mod client;
 pub mod codec;
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
-use crate::resources::ChecksumMap;
-use crate::util::{Outgoing, Sha256Sum};
 
 static REQUESTID_COUNTER: AtomicU64 = AtomicU64::new(1);
 

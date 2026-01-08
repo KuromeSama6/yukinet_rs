@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use tokio::fs::File;
-use tokio::io::BufReader;
+use tokio::io::{BufReader, BufWriter};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use crate::asyncutil;
@@ -25,7 +25,6 @@ impl Resource {
     pub async fn read_buf(&self) -> anyhow::Result<BufReader<File>> {
         let path = Path::new("resources").join(&self.path);
 
-        debug!("read buf path: {}", path.display());
         let file = File::open(path).await?;
         Ok(BufReader::new(file))
     }
@@ -74,18 +73,30 @@ static COMMON_STATE: OnceLock<CommonState> = OnceLock::new();
 pub async fn init() -> anyhow::Result<()> {
     fs::create_dir_all("resources").await?;
 
-    info!("Creating resource map...");
+    let state = CommonState {
+        resources: RwLock::new(HashMap::new())
+    };
+    COMMON_STATE.set(state).unwrap();
+
+    rebuild_resources().await?;
+
+    Ok(())
+}
+
+pub async fn rebuild_resources() -> anyhow::Result<()> {
+    info!("Rebuilding resources...");
     let sw = Instant::now();
     let base_path = Path::new("resources");
     let fingerprints = &read_fingerprint_cache().await?;
     let resource_map = map_resources(base_path, fingerprints).await?;
     write_fingerprint_cache(&resource_map).await?;
 
-    info!("Resources mapped in {} seconds with {} resources.", &sw.elapsed().as_secs_f32(), &resource_map.len());
+    let len = resource_map.len();
 
-    COMMON_STATE.set(CommonState {
-        resources: RwLock::new(resource_map)
-    }).unwrap();
+    let mut write = COMMON_STATE.get().unwrap().resources.write().await;
+    *write = resource_map;
+
+    info!("Resources mapped in {} seconds with {} resources.", &sw.elapsed().as_secs_f32(), len);
 
     Ok(())
 }
@@ -108,11 +119,9 @@ pub async fn diff_checksums(checksums: &ChecksumMap) -> Vec<String> {
     for (path, checksum) in checksums.iter() {
         if let Some(resource) = resources.get(path) {
             if &resource.checksum != checksum {
-                debug!("Resource '{}' checksum mismatch (expected: {:?}, got: {:?})", path, resource.checksum, checksum);
                 ret.push(path.clone());
             }
         } else {
-            debug!("Resource '{}' not found in local resources.", path);
             ret.push(path.clone());
         }
     }
@@ -128,6 +137,17 @@ pub async fn get_resource(path: &str) -> Option<Resource> {
     } else {
         None
     }
+}
+
+pub async fn open_write(path: String) -> anyhow::Result<BufWriter<File>> {
+    let full_path = Path::new("resources").join(&path);
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    let file = File::create(full_path).await?;
+
+    Ok(BufWriter::new(file))
 }
 
 #[async_recursion::async_recursion]

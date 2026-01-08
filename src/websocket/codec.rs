@@ -35,10 +35,10 @@ impl MessageBinary {
         write.write_bool(self.response)?;
         write.write_all(&self.data)?;
 
-        Ok(write.consume_bytes())
+        Ok(write.to_bytes())
     }
 
-    pub fn consume_reader(self) -> EzReader<Cursor<Vec<u8>>> {
+    pub fn to_reader(self) -> EzReader<Cursor<Vec<u8>>> {
         let cursor = Cursor::new(self.data);
 
         EzReader::new(cursor)
