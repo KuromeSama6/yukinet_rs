@@ -1,4 +1,5 @@
 pub mod buf;
+pub mod json;
 
 use std::fs::File;
 use std::io::Read;

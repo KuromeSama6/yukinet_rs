@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedReceiver;
 use uuid::{uuid, Uuid};
 use crate::util::generate_random_bytes;
+use crate::util::json::{FromJson, JsonWrapper};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MasterConfig {
@@ -23,6 +24,18 @@ impl Default for MasterConfig {
             http_host: "0.0.0.0".to_string(),
             http_port: 23662,
             secret: hex::encode(secret),
+        }
+    }
+}
+
+impl FromJson for MasterConfig {
+    fn from_json(data: &JsonWrapper) -> Self {
+        Self {
+            websocket_host: data.get_str("websocket_host"),
+            websocket_port: data.get_u16("websocket_port"),
+            http_host: data.get_str("http_host"),
+            http_port: data.get_u16("http_port"),
+            secret: data.get_str("secret"),
         }
     }
 }
