@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, SeekFrom};
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{bail, Context};
@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use http::Request;
 use log::{debug, error, info, warn};
 use tokio::fs::File;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::sync::{mpsc, oneshot, OnceCell, RwLock};
 use tokio::time::Instant;
@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::{Error, Message, Utf8Bytes};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use url::Url;
 use crate::config::{WorkerConfig};
-use crate::{master, resources};
+use crate::{constants, master, resources};
 use crate::message::WebsocketMessage;
 use crate::resources::ChecksumMap;
 use crate::util::{Outgoing};
@@ -132,13 +132,13 @@ async fn update_resource(path: &str) -> anyhow::Result<()> {
 
     let (tx, rx) = oneshot::channel();
 
-    let buf = resources::open_write(path.to_string()).await?;
+    let file = resources::open_write(path.to_string(), len).await?;
     let download = ResourceDownload {
         path: path.to_string(),
         fin_tx: Some(tx),
         len: len as usize,
         rcv: AtomicUsize::new(0),
-        buf,
+        file
     };
     STATE.get().unwrap().resource_download.write().await.replace(download);
 
@@ -218,9 +218,14 @@ impl ClientHandler for WebsocketClientHandler {
 
             if let Some(download) = write.as_mut() {
                 let mut buf = Vec::new();
+                let seq = msg.read_u32()?;
                 msg.read_to_end(&mut buf)?;
 
-                download.buf.write_all(&buf).await?;
+                // write into file
+                let start = seq as usize * constants::RESOURCE_CHUNK_SIZE;
+                download.file.seek(SeekFrom::Start(start as u64)).await?;
+                download.file.write_all(&buf).await?;
+
                 let read = buf.len();
                 let rcv = download.rcv.fetch_add(buf.len(), Ordering::SeqCst) + read;
 
@@ -235,7 +240,7 @@ impl ClientHandler for WebsocketClientHandler {
 
                     ack_tx = Some(tx);
                     fin_download = true;
-                    download.buf.flush().await?;
+                    download.file.flush().await?;
                 }
 
             }
@@ -277,7 +282,7 @@ impl WorkerState {
 #[derive(Debug)]
 struct ResourceDownload {
     path: String,
-    buf: BufWriter<File>,
+    file: File,
     rcv: AtomicUsize,
     len: usize,
     fin_tx: Option<oneshot::Sender<()>>,

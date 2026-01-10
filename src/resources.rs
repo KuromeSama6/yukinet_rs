@@ -3,9 +3,10 @@ use tokio::fs;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
+use anyhow::bail;
 use serde::{Deserialize, Serialize};
-use tokio::fs::File;
-use tokio::io::{BufReader, BufWriter};
+use tokio::fs::{File, OpenOptions};
+use tokio::io::{AsyncReadExt, BufReader, BufWriter};
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use crate::asyncutil;
@@ -139,15 +140,21 @@ pub async fn get_resource(path: &str) -> Option<Resource> {
     }
 }
 
-pub async fn open_write(path: String) -> anyhow::Result<BufWriter<File>> {
+pub async fn open_write(path: String, len: u64) -> anyhow::Result<File> {
     let full_path = Path::new("resources").join(&path);
     if let Some(parent) = full_path.parent() {
         fs::create_dir_all(parent).await?;
     }
 
-    let file = File::create(full_path).await?;
+    let ret = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(full_path).await?;
 
-    Ok(BufWriter::new(file))
+    ret.set_len(len).await?;
+
+    Ok(ret)
 }
 
 #[async_recursion::async_recursion]

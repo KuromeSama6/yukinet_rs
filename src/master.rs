@@ -26,13 +26,11 @@ use crate::error::WebsocketError;
 use crate::error::WebsocketError::{AuthenticationFailure, ClientDisconnect, NotAuthenticated, Protocol, UnknownMessage};
 use crate::master::MasterCommand::Shutdown;
 use crate::message::WebsocketMessage;
-use crate::resources;
+use crate::{constants, resources};
 use crate::resources::Resource;
 use crate::util::buf::{EzReader, EzWriteBuf};
 use crate::util::Outgoing;
 use crate::websocket::server::{Client, ServerHandler, WebsocketServer};
-
-static RESOURCE_CHUNK_SIZE: usize = 1024 * 32;
 
 static STATE: OnceLock<Arc<MasterState>> = OnceLock::new();
 static WEBSOCKET: OnceLock<Arc<WebsocketServer>> = OnceLock::new();
@@ -116,10 +114,7 @@ async fn handle_ws_msg(worker: Arc<Worker>, msg: WebsocketMessage) -> anyhow::Re
                 bail!("Worker {} requested resource transfer without a pending download.", worker.addr);
             }
 
-            let cworker = worker.clone();
-            tokio::spawn(async move {
-                cworker.transfer_resource().await;
-            });
+            worker.transfer_resource().await;
         }
 
         WebsocketMessage::ResourceFinishTransfer => {
@@ -375,18 +370,23 @@ impl Worker {
         let path = current.as_ref().unwrap().clone();
         let resource = resources::get_resource(path.as_str()).await.unwrap();
         let mut reader = resource.read_buf().await?;
-        let mut buf = [0u8; RESOURCE_CHUNK_SIZE];
+        let mut buf = [0u8; constants::RESOURCE_CHUNK_SIZE];
 
         let mut count = 0usize;
-
+        let mut seq = 0u32;
+        
         let websocket = WEBSOCKET.get().unwrap().get_client(self.addr).await.unwrap();
 
         loop {
             let n = reader.read(&mut buf).await?;
             count += n;
 
-            let chunk = buf[..n].to_vec();
-            websocket.send_binary(chunk).await?;
+            let mut write = EzWriteBuf::default();
+            write.write_u32(seq);
+            write.write_all_slice(&buf[..n]);
+            seq += 1;
+            
+            websocket.send_binary(write.to_bytes()).await?;
 
             if count >= resource.fingerprint.size as usize {
                 break;

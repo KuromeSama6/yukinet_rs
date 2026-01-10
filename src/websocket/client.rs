@@ -9,7 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::{Bytes, Error, Message, Utf8Bytes};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -192,7 +192,9 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
     }
 
     let (ws, res) = res.unwrap();
-    let (mut tx, mut rx) = ws.split();
+    let (tx, mut rx) = ws.split();
+    let tx = Arc::new(Mutex::new(tx));
+
     let (websocket_tx, mut outbound_rx) = mpsc::channel(32);
     state.websocket_tx.set(websocket_tx).unwrap();
 
@@ -203,6 +205,9 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
     state.handler.on_connected(state.clone()).await?;
 
     loop {
+        let state = state.clone();
+        let tx = tx.clone();
+
         tokio::select! {
             res = rx.next() => {
                 match res {
@@ -222,22 +227,37 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
 
                                     let _ = req.tx.send(msg);
 
+                                } else if id != 0 {
+                                    // send request
+                                    tokio::spawn(async move {
+                                        let res: anyhow::Result<()> = async {
+                                            let res_str = state.handler.on_request(state.clone(), msg_text.text.to_string()).await?;
+                                            let res = MessageText {
+                                                id,
+                                                response: true,
+                                                text: res_str,
+                                            };
+
+                                            let mut tx = tx.lock().await;
+                                            tx.send(Message::Text(serde_json::to_string(&res)?.into())).await?;
+
+                                            Ok(())
+                                        }.await;
+
+                                        if let Err(e) = res {
+                                            error!("Error handling websocket request: {e}");
+                                        }
+                                    });
+
                                 } else {
-                                    if id != 0 {
-                                        // send request
-                                        let res_str = state.handler.on_request(state.clone(), msg_text.text.to_string()).await?;
-                                        let res = MessageText {
-                                            id,
-                                            response: true,
-                                            text: res_str,
-                                        };
+                                    // handle normal message
+                                    tokio::spawn(async move {
+                                        let res = state.handler.on_msg(state.clone(), msg_text.text.to_string()).await;
 
-                                        tx.send(Message::Text(serde_json::to_string(&res)?.into())).await?;
-
-                                    } else {
-                                        // handle normal message
-                                        state.handler.on_msg(state.clone(), msg_text.text.to_string()).await?;
-                                    }
+                                        if let Err(e) = res {
+                                            error!("Error handling websocket message: {e}");
+                                        }
+                                    });
                                 }
                             }
 
@@ -259,21 +279,34 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
 
                                     if id != 0 {
                                         // send request
-                                        let mut res_buf = EzWriteBuf::default();
-                                        state.handler.on_request_bin(state.clone(), &mut reader, &mut res_buf).await?;
-                                        let res_data = res_buf.to_bytes();
+                                        tokio::spawn(async move {
+                                            let res: anyhow::Result<()> = async {
+                                                let mut res_buf = EzWriteBuf::default();
+                                                state.handler.on_request_bin(state.clone(), &mut reader, &mut res_buf).await?;
+                                                let res_data = res_buf.to_bytes();
 
-                                        let res = MessageBinary {
-                                            id,
-                                            response: true,
-                                            data: res_data,
-                                        };
+                                                let res = MessageBinary {
+                                                    id,
+                                                    response: true,
+                                                    data: res_data,
+                                                };
 
-                                        tx.send(Message::Binary(res.serialize()?.into())).await?;
+                                                let mut tx = tx.lock().await;
+                                                tx.send(Message::Binary(res.serialize()?.into())).await?;
+
+                                                Ok(())
+                                            }.await;
+                                        });
 
                                     } else {
                                         // handle normal message
-                                        state.handler.on_msg_bin(state.clone(), &mut reader).await?;
+                                        tokio::spawn(async move {
+                                            let res = state.handler.on_msg_bin(state.clone(), &mut reader).await;
+
+                                            if let Err(e) = res {
+                                                error!("Error handling websocket binary message: {e}");
+                                            }
+                                        });
                                     }
                                 }
                             }
@@ -297,6 +330,7 @@ async fn websocket_loop(conn_request: http::Request<()>, state: Arc<WebsocketCli
             }
 
             Some(msg) = outbound_rx.recv() => {
+                let mut tx = tx.lock().await;
                 tx.send(msg).await?;
             }
         }

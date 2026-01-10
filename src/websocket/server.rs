@@ -147,7 +147,8 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
     let ws = tokio_tungstenite::accept_hdr_async(stream, |req: &Request, res: Response| websocket_handle_headers(state.clone(), addr.clone(), req, res)).await?;
 
     let (mut tx, mut rx) = ws.buffer(1024).split();
-
+    let tx = Arc::new(Mutex::new(tx));
+    
     info!("Client connected: {addr}");
     let (client_tx, mut client_rx) = mpsc::channel(32);
 
@@ -165,6 +166,7 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
 
     loop {
         let state = state.clone();
+        let tx = tx.clone();
 
         tokio::select! {
             Some(msg) = rx.next() => {
@@ -183,24 +185,38 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
 
                                     req.tx.send(cmsg);
 
+                                } else if inbound.id != 0 {
+                                    // wants a response
+                                    tokio::spawn(async move {
+                                        let res: anyhow::Result<()> = async {
+                                            let res = state.handler.on_request(state.clone(), addr, inbound.text.clone()).await?;
+        
+                                            let outbound = MessageText {
+                                                id: inbound_id,
+                                                response: true,
+                                                text: res
+                                            };
+        
+                                            let mut tx = tx.lock().await;
+                                            tx.send(outbound.serialize_msg()?).await?;
+                                            
+                                            Ok(())
+                                        }.await;
+                                        
+                                        if let Err(e) = res {
+                                            error!("Error handling websocket request from {addr}: {e}");
+                                        }
+                                    });
+
                                 } else {
-                                    if inbound.id != 0 {
-                                        // wants a response
-                                        let res = state.handler.on_request(state.clone(), addr, inbound.text.clone()).await?;
-
-                                        let outbound = MessageText {
-                                            id: inbound_id,
-                                            response: true,
-                                            text: res
-                                        };
-
-                                        tx.send(outbound.serialize_msg()?).await?
-
-                                    } else {
-                                        // does not require a response
-                                        state.handler.on_msg(state.clone(), addr, inbound.text.clone()).await?;
-                                    }
-
+                                    // does not require a response
+                                    tokio::spawn(async move {
+                                        let res = state.handler.on_msg(state.clone(), addr, inbound.text.clone()).await;
+                                        
+                                        if let Err(e) = res {
+                                            error!("Error handling websocket message from {addr}: {e}");
+                                        }
+                                    });
                                 }
 
                             }
@@ -220,20 +236,37 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
 
                                     if inbound_id != 0 {
                                         // wants a response
-                                        let mut res = EzWriteBuf::default();
-                                        state.handler.on_request_bin(state.clone(), addr, &mut data_reader, &mut res).await?;
-
-                                        let outbound = MessageBinary {
-                                            id: inbound_id,
-                                            response: true,
-                                            data: res.to_bytes(),
-                                        };
-
-                                        tx.send(Message::Binary(outbound.serialize()?.into())).await?
+                                        tokio::spawn(async move {
+                                            let res: anyhow::Result<()> = async {
+                                                let mut res = EzWriteBuf::default();
+                                                state.handler.on_request_bin(state.clone(), addr, &mut data_reader, &mut res).await?;
+        
+                                                let outbound = MessageBinary {
+                                                    id: inbound_id,
+                                                    response: true,
+                                                    data: res.to_bytes(),
+                                                };
+        
+                                                let mut tx = tx.lock().await;
+                                                tx.send(Message::Binary(outbound.serialize()?.into())).await?;
+                                                
+                                                Ok(())
+                                            }.await;
+                                            
+                                            if let Err(e) = res {
+                                                error!("Error handling websocket binary request from {addr}: {e}");
+                                            }
+                                        });
 
                                     } else {
                                         // does not require a response
-                                        state.handler.on_msg_bin(state.clone(), addr, &mut data_reader).await?;
+                                        tokio::spawn(async move {
+                                            let res = state.handler.on_msg_bin(state.clone(), addr, &mut data_reader).await;
+                                            
+                                            if let Err(e) = res {
+                                                error!("Error handling websocket binary message from {addr}: {e}");
+                                            }
+                                        });
                                     }
                                 }
                             }
@@ -258,15 +291,18 @@ async fn websocket_handle_connection(state: Arc<WebsocketServer>, addr: SocketAd
             }
 
             Some(msg) = client_rx.recv() => {
+                let mut tx = tx.lock().await;
                 tx.send(msg).await?;
             }
 
             _ = client_close.cancelled() => {
+                let mut tx = tx.lock().await;
                 tx.send(Message::Close(None)).await?;
                 break;
             }
 
             _ = state.shutdown.cancelled() => {
+                let mut tx = tx.lock().await;
                 tx.send(Message::Close(None)).await?;
                 break;
             }
